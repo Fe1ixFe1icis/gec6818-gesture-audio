@@ -50,7 +50,7 @@
 | 类别 | 选型 |
 |---|---|
 | 语言 | C（必要时 Python 写 PC 客户端） |
-| 平台 | GEC6818（ARM Cortex-A53）+ Ubuntu 18.04 虚拟机交叉编译 |
+| 平台 | GEC6818（ARM Cortex-A53）+ Ubuntu 18.04 虚拟机交叉编译（`arm-linux-gcc` 5.4.0，软浮点 ABI） |
 | 音频 | ALSA / madplay，WAV/MP3 |
 | 网络 | TCP socket + 自定义文本协议，UDP 可选 |
 | 版本管理 | Git + GitHub |

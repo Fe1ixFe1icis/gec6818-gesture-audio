@@ -81,7 +81,7 @@
 
 ## 1. 项目事实（AI 必须先知道）
 
-- 目标平台：GEC6818（ARM Cortex-A53），Ubuntu 18.04 虚拟机交叉编译（`arm-linux-gnueabi-gcc`），代码以 C 为主。
+- 目标平台：GEC6818（ARM Cortex-A53），Ubuntu 18.04 虚拟机交叉编译（`arm-linux-gcc` 5.4.0，`arm-none-linux-gnueabi` 软浮点；板端 `ld-linux.so.3` / glibc 2.23），代码以 C 为主。
 - 项目定义见 `projectBrief.md`（需求、架构、协议、里程碑），协作纪律见 `devFlow.md`（分支、提交格式、板子占用、接口冻结）。
 - 模块与文件对应：`src/sensor.c`、`src/player.c`、`src/effect.c`、`src/display.c`、`src/server.c`、`src/main.c`；公共头文件在 `include/`。
 - **接口冻结**：`include/` 下头文件、共享参数结构体、`projectBrief.md §6` 的通信协议，在 M1 结束后不得擅自修改。AI 若认为必须改，先停下来向人类说明影响面，等确认。

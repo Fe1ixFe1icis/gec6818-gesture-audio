@@ -10,7 +10,7 @@
 
 | 标记 | 含义 |
 |---|---|
-| ✅ | 本机（Windows + MinGW，`BOARD=0`）已实测通过，附实测值 |
+| ✅ | 主机（`BOARD=0`，Windows/Linux 均可）已实测通过，附实测值 |
 | ⏳ | 必须真板（ALSA / framebuffer / I2C / NFS）才能确认，本机未验证 |
 | ⚠️ | 已知限制或缺陷，见 §5；不算"测试失败"，但不能当通过 |
 
@@ -24,7 +24,7 @@
 | 项 | 要求 |
 |---|---|
 | 板子 | GEC6818，已能串口/网络登录（见 `boardGuide.md §2`） |
-| 集成机 | Ubuntu 18.04 + `arm-linux-gnueabihf-gcc`（**硬浮点**；用 `gnueabi` 会报 `No such file or directory`） |
+| 集成机 | Ubuntu 18.04 + `arm-linux-gcc`（**本板软浮点**；`-dumpmachine` = `arm-none-linux-gnueabi`，见 `boardGuide.md §2.5`） |
 | 共享目录 | 集成机 `~/nfs` 已导出，板子已挂载 `/mnt/nfs` |
 | 素材 | 一份 44.1kHz / 16bit / 1~2 声道 WAV（§2） |
 | 客户端 | 任意 PC 上的 Python 3 + `tools/netctl.py` |
@@ -33,8 +33,8 @@
 ### 1.1 编译
 
 ```bash
-# 集成机（板端，推荐）
-make BOARD=1 CROSS=arm-linux-gnueabihf-
+# 集成机（板端，推荐；本板软浮点 → arm-linux-）
+make BOARD=1 CROSS=arm-linux-
 # 产物 build/gesture_audio，链接 ALSA
 
 # 集成机（主机侧自测，验证代码再上板）
@@ -47,17 +47,30 @@ make && make tools
 
 ### 1.2 上板部署
 
-```bash
-# 集成机：把构建产物放进 NFS 共享目录
-cp build/gesture_audio ~/nfs/
-cp build/test_44100.wav ~/nfs/audio/         # 目录不存在则先 mkdir -p
+> **本板 eth0 实测不可用**（`Cannot attach to PHY -19`，PHY ID 全 0），NFS/scp 走不通。
+> 当前用 **TF 卡 / U 盘 / 串口 Zmodem** 把 `gapp.tgz` 送上去，详见 `ubuntuArmBuild.md §7`。
 
-# 板子上
-mount -t nfs -o nolock,vers=3 <集成机IP>:/home/gec6818/nfs /mnt/nfs
-cd /mnt/nfs && chmod +x gesture_audio && ./gesture_audio --selftest audio/test_44100.wav
+```bash
+# 集成机：把构建产物、libasound、配置树、素材打成一个包
+cd ~/gec6818
+mkdir -p ~/stage/{bin,usr/lib,usr/share,audio}
+cp build/gesture_audio ~/stage/bin/
+cp ~/alsa-lib-1.1.3/install/usr/lib/libasound.so.2.0.0 ~/stage/usr/lib/
+ln -sf libasound.so.2.0.0 ~/stage/usr/lib/libasound.so.2
+cp -a ~/alsa-lib-1.1.3/install/usr/share/alsa ~/stage/usr/share/
+make tools && ./build/gen_wav ~/stage/audio/test_44100.wav 8
+cd ~/stage && tar czf gapp.tgz .
+
+# 板子上（TF 卡示例）
+mkdir -p /tmp/gapp && cd /tmp/gapp
+cp /mnt/sd/gapp.tgz . && gzip -d gapp.tgz && tar xf gapp.tar
+export LD_LIBRARY_PATH=/tmp/gapp/usr/lib
+export ALSA_CONFIG_PATH=/tmp/gapp/usr/share/alsa/alsa.conf
+./bin/gesture_audio --selftest audio/test_44100.wav
 ```
 
-> NFS 参数必须是 `nolock,vers=3`，写成 `nlock` 会挂载失败（`boardGuide.md §4` 校注）。
+> NFS 参数必须是 `nolock,vers=3`，写成 `nlock` 会挂载失败（`boardGuide.md §2.4` 校注）；
+> 但本板当前 PHY 不可用，NFS 只能等换板/修好后再用。
 
 ## 2. 测试素材
 
@@ -78,23 +91,40 @@ cd /mnt/nfs && chmod +x gesture_audio && ./gesture_audio --selftest audio/test_4
 
 ## 3. 用例
 
-### T0 产物静态检查（✅ 本机通过）
+### T0 产物静态检查（⏳ 待 ARM 产物；VM 交叉编译后回填）
 
-| 检查 | 命令 | 预期 |
+```bash
+readelf -h build/gesture_audio | grep -E "Class:|Machine:"
+readelf -l build/gesture_audio | grep interpreter
+readelf -d build/gesture_audio | grep NEEDED
+readelf --version-info build/gesture_audio | grep -o 'GLIBC_[0-9.]*' | sort -u
+# 或一键
+make BOARD=1 CROSS=arm-linux- READELF=readelf verify
+```
+
+| 检查 | 命令 | 预期（本板实测） |
 |---|---|---|
 | 二进制架构 | `readelf -h build/gesture_audio \| grep Machine` | `ARM`（x86 说明编错了工具链） |
-| 动态链接器 | `readelf -l build/gesture_audio \| grep interpreter` | 与板子 `/lib` 下一致（硬浮点镜像通常是 `ld-linux-armhf.so.3`） |
+| 动态链接器 | `readelf -l build/gesture_audio \| grep interpreter` | **`/lib/ld-linux.so.3`**（软浮点；`armhf` 会是 `ld-linux-armhf.so.3`，本板跑不了） |
 | 依赖库 | `readelf -d build/gesture_audio \| grep NEEDED` | 含 `libasound.so.2`、`libpthread`、`libm`、`libc` |
+| GLIBC 需求 | `readelf --version-info …` | 最大值 ≤ **2.23**（本板 `/lib/libc.so.6 -> libc-2.23.so`） |
 | 文件类型 | `file build/gesture_audio` | `ELF 32-bit LSB executable, ARM, EABI5` |
 
-判定：任一项不符 → 工具链/ABI 问题，**不要**上板试。
+> 本板不要检查 `Tag_ABI_VFP_args`：软浮点对象通常**没有**这个标记，缺失是正常的；
+> 真正的判据是解释器路径 `ld-linux.so.3` 与板端一致。
 
-### T1 内置自检（✅ 本机 20/20）
+判定：任一项不符 → 工具链/ABI 问题，**不要**上板试。完整流程见 `ubuntuArmBuild.md §6`。
+
+### T1 内置自检（✅ 本机 + 板端均 20/20）
 
 ```bash
 ./gesture_audio --selftest                     # 19 通过 / 0 失败 / 1 跳过
 ./gesture_audio --selftest audio/test_44100.wav # 20 通过 / 0 失败 / 0 跳过
 ```
+
+**板端实测（2026-11-11，`/tmp/gapp`）**：`[PASS] 20 WAV 素材体检`、
+`结果：20 通过 / 0 失败 / 0 跳过`。串口上显示成 `锛0 ...` 是终端编码问题，
+见 `boardGuide.md §2.2.1`：SecureCRT 字符编码要改成 **UTF-8**。
 
 覆盖：参数默认值与 clamp、队列满丢最旧/ FIFO / 超时、指令→参数翻译、协议解析、
 回声时序、EQ 旁通与增益、WAV 头体检。**不碰声卡/LCD/传感器**，所以主机也能跑。
@@ -138,15 +168,23 @@ cd /mnt/nfs && chmod +x gesture_audio && ./gesture_audio --selftest audio/test_4
 [UI] PLAYING ---- vol=65 spd=1.0 echo=off/250ms/40 eq=+0/+0/+0 00:01/00:08 trk=1/1 net=0 und=0 ges=UP dist=317mm
 ```
 
-#### T2.3 真机 LCD（⏳ 待板端）
+#### T2.3 真机 LCD（✅ 2026-11-12 01:04 通过）
 
 ```bash
 ./gesture_audio --sensor sim --log info audio/test_44100.wav
 ```
 
-预期：`framebuffer 就绪：800x480 ...`，屏幕 5fps 刷新，无撕裂、无残影；
-参数变化后 200ms 内可见。若日志出现 `framebuffer 不可用，显示线程降级为终端输出`，
-说明 `/dev/fb0` 打不开（权限或镜像无 fb），记录该行原文。
+**板端实测**：
+
+```
+01:04:41 INFO  [display] framebuffer 就绪：800x480 line=3200 map=4608000
+01:04:41 INFO  [display] 显示线程启动，刷新间隔 200 ms（framebuffer）
+```
+
+判定：`framebuffer 就绪` 行出现、`line=3200`（800×4）、`map=4608000`（800×480×4×?)；
+屏幕 5fps 刷新、无撕裂/残影，参数变化后 200ms 内可见。
+若日志出现 `framebuffer 不可用，显示线程降级为终端输出`，说明 `/dev/fb0` 打不开
+（权限或镜像无 fb），记录该行原文。
 
 ### T3 播放与音效
 
@@ -166,18 +204,33 @@ cd /mnt/nfs && chmod +x gesture_audio && ./gesture_audio --selftest audio/test_4
 
 判定：`曲目 … 打开` 有输出、`队列丢弃 0`、无 `PLAY_ERROR`。
 
-#### T3.2 真机出声（⏳ 待板端）
+#### T3.2 真机出声（✅ 2026-11-12 01:04 通过，30s und=0）
 
 ```bash
-./gesture_audio --sensor sim --log info audio/test_44100.wav
+./bin/gesture_audio --sensor sim --log info audio/test_44100.wav
 # 另一个终端
 aplay -l
 ```
 
-预期：`ALSA 就绪：rate=44100 period=512 帧(11.6ms) buffer=2048 帧(46.4ms)`；
-双音段可闻，静音段安静；`und=0` 稳定。
+**实测记录（COM4，耳机输出）**：
 
-失败对照：无 `ALSA 就绪` → 设备被 Qt/madplay 占用或 `/dev/snd` 不存在（`boardGuide.md §3.3`）。
+- 曲目正常打开并推进：`曲目 1/1：audio/test_44100.wav（44100 Hz / 2 ch / 8.0 s）`；
+- 耳机可闻双音与静音段；效果器听感可辨；
+- 手势链路生效：UP/DOWN 使 `vol` 60→65→70，PULL 使 `spd` 在 0.5/1.9 间切换，
+  NEXT/PAUSE/PLAY 在日志中出现并切歌/暂停/恢复；
+- 30 秒稳定播放实测：
+
+  ```
+  [player] ALSA 设备：plughw:0,0
+  [player] ALSA 就绪：rate=44100 period=512 帧(11.6ms) buffer=2050 帧(46.5ms)
+  underrun count: 0
+  运行结束：抑制手势 0 次，队列丢弃 0 条
+  ```
+
+- 结论：`default` 在本板打不开，代码回退到 `plughw:0,0`；**30 秒 0 underrun**。
+  之前切换/启动瞬间出现的 `ALSA underrun` 未在稳定播放中复现，暂不改 period。
+
+判定：耳机可闻、`ALSA 就绪` 行存在、30 秒 `underrun = 0`、`队列丢弃 0`、无 `ERROR`。
 
 #### T3.3 EOF 判定（✅ 本机通过）
 
@@ -194,7 +247,7 @@ python tools/netctl.py <板子IP> STATUS
 ⚠️ 主机上**不能用 8 秒素材直接等 EOF**：sim 后端每 3 秒来一个手势，其中 RIGHT/LEFT 会切歌重开，
 EOF 永远等不到。必须用"素材时长 < 首个切歌手势（3s）"的短素材，或在远程把 `SPEED` 拉高提前播完。
 
-#### T3.4 EOF 后重新播放（⚠️ 当前不通过，见 D1）
+#### T3.4 EOF 后重新播放（✅ 本机通过，D1 已修）
 
 ```bash
 # 2 秒素材，等 EOF 后发 NEXT
@@ -203,7 +256,16 @@ python tools/netctl.py <板子IP> STATUS
 ```
 
 预期：`state=PLAYING` 且 `pos` 从 0 开始增长。
-**实测：`state=PLAYING` 但 `pos` 永远停在 0，不再产帧**（详见 §5 D1）。
+
+2026-11-11 修复后实测（`tools/player_regress.py` D1 用例）：
+
+```
+reached EOF : EOF
+NEXT reply  : OK NEXT
+[PASS] D1 EOF 后 NEXT 恢复播放  state=PLAYING pos=650
+```
+
+修复内容见 §5 D1。
 
 #### T3.5 变速（⚠️ 判据是"时间对"，不是"进度条对"）
 
@@ -216,28 +278,29 @@ python tools/netctl.py <板子IP> "SPEED 2.0" STATUS
 ⚠️ `STATUS` 的 `pos/len` 是**源时间**：1.5 倍速时 pos 增长也快 1.5 倍，
 8 秒素材在 5.3 秒就 `pos=8000`。看到"进度条跳得快"属正常，不要记为缺陷。
 
-#### T3.6 暂停 / 恢复（⚠️ 位置对、状态不对，见 D2）
+#### T3.6 暂停 / 恢复（✅ 本机通过，D2 已修）
 
 ```bash
 python tools/netctl.py <板子IP> "PAUSE"
 sleep 2
-python tools/netctl.py <板子IP> STATUS      # 位置应冻结
+python tools/netctl.py <板子IP> STATUS      # 位置应冻结、状态应为 PAUSED
 python tools/netctl.py <板子IP> "RESUME"
 ```
 
-实测（✅ 位置冻结 / ⚠️ 状态未上报）：
+2026-11-11 修复后实测（`tools/player_regress.py` D2 用例）：
 
 ```
-PAUSE 前   state=PLAYING pos=1578
-PAUSE 后   state=PLAYING pos=2042     ← 位置冻结，说明暂停真的生效
-+2 秒后    state=PLAYING pos=2042
-RESUME 后  state=PLAYING pos=5850
+before PAUSE: state=PLAYING pos=2321
+PAUSE reply : OK PAUSE
+[PASS] D2 PAUSE 上报 PAUSED  PAUSED/PAUSED
+[PASS] D2 暂停期间 pos 冻结  pos 2321 -> 2321
+[PASS] D2 RESUME 恢复 PLAYING  state=PLAYING pos=4364
 ```
 
-判定：**位置`pos` 在暂停期间必须不动**（实测通过）；`state` 应显示 `PAUSED`，实测仍是 `PLAYING`（D2）。
+判定：暂停期间 `pos` 不动且 `state=PAUSED`；`RESUME` 后继续推进。修复内容见 §5 D2。
 
 ⚠️ 主机版还有"追帧"现象：暂停期间墙钟继续走、空 sink 不补偿，`RESUME` 后会全速播一小段把差补回来
-（实测 pos 一次跳 ~3.8 秒）。板上由 ALSA 设备节拍控制，预期不会这样，板端需复测确认。
+（实测 pos 一次跳 ~1–4 秒）。板上由 ALSA 设备节拍控制，预期不会这样，板端需复测确认。
 
 #### T3.7 回声 / EQ（⏳ 听感，板端）
 
@@ -395,19 +458,20 @@ DEBUG 指令 7 去抖丢弃（0 ms 内重复）
 
 | 现象 | 最可能原因 | 先验证 | 处理 |
 |---|---|---|---|
-| 执行 `./gesture_audio` 报 `No such file or directory` 但文件存在 | 工具链 ABI 不匹配（gnueabi vs gnueabihf） | `readelf -h` / `readelf -l \| grep interpreter` | 换成 `arm-linux-gnueabihf-` 重编（T0） |
+| 执行 `./gesture_audio` 报 `No such file or directory` 但文件存在 | 工具链与板端 loader 不匹配（本板软浮点 `ld-linux.so.3`） | `readelf -l \| grep interpreter` | 换 `arm-linux-`（`arm-none-linux-gnueabi`）重编（T0） |
 | `ALSA 打开失败` | 设备被占用 / `/dev/snd` 缺失 | `aplay -l`、`ls /dev/snd` | 杀掉 madplay/Qt，再起；记录日志原文 |
 | 有日志无声 | 素材格式不符（非 PCM/16bit/立体声） | `--selftest audio/xxx.wav` 看第 20 条 | 用 `tools/gen_wav` 重新生成 |
-| `pos` 不动、state 却 PLAYING | EOF 后切歌（D1） | 复现 T3.4 | 见 §5 D1，记录现场版本 |
+| `pos` 不动、state 却 PLAYING | EOF 后切歌（D1，已修） | 复现 T3.4 | 若仍复现，记录版本与日志，按 §5 D1 回归 |
 | 屏幕上参数与客户端不一致 | 仲裁把某一条抑制了 | 服务端 `--log debug` 看 `被抑制` | 正常行为；调 `ARB_NET_HOLD_MS` 需走接口评审 |
-| `PAUSE` 后 `state` 仍 `PLAYING` | 暂停分支不上报状态（D2） | T3.6 | 见 §5 D2，以 `pos` 冻结为准 |
+| `PAUSE` 后 `state` 仍 `PLAYING` | 暂停分支不上报状态（D2，已修） | T3.6 | 见 §5 D2；仍复现则查是否新版本 |
+| 坏文件/USB 拔掉后 `state` 一直是 STOPPED | ERROR 未上报（D3，已修） | 给不存在的 WAV 启动 | 见 §5 D3，`ERROR` 应粘滞到 `PLAY` |
 | `bind 端口失败` | 上一次进程没退/端口被占 | `ps \| grep gesture` | `killall gesture_audio` 后重启 |
 | 客户端收到 `ERR 连接数已满` | 已有 4 个连接 | `netctl --clients 5` 复现 | 正常；先 `QUIT` 掉旧连接 |
 | NFS 挂载卡住 | 少了 `nolock,vers=3` | `mount \| grep nfs` | 按 §1.2 重挂 |
 
 ## 5. 缺陷与已知限制
 
-### D1（缺陷，待修）：EOF 后切歌，播放线程停摆
+### D1（已修 2026-11-11）：EOF 后切歌，播放线程停摆
 
 - **现象**：曲目播完（`state=EOF`）后收到 `NEXT`/`PREV`/左右手势 → 日志显示 `曲目 x/y 打开`、
   `state` 变 `PLAYING`，但 `pos` 永远停在 0，不再产帧（无声、无波形更新）。
@@ -416,29 +480,68 @@ DEBUG 指令 7 去抖丢弃（0 ms 内重复）
 - **根因**（`src/player.c`）：`player_skip()` 只在 `s_req == PLAY_STOPPED` 时置 `PLAY_PLAYING`；
   EOF 时 `s_req` 仍是 `PLAY_EOF`。`player_thread` 的 `switch (req)` 走 `case PLAY_EOF: sleep; continue`，
   于是只有 `s_reopen` 那一轮切了文件，之后再不生产帧。
-- **最小修复**（建议由 player 模块负责人确认后提交，AI 不擅自改他人模块）：
+- **修复**（两处，缺一不可）：
 
   ```c
-  /* player_skip() 内，替换原 s_req 判定 */
-  if (s_req == PLAY_STOPPED || s_req == PLAY_EOF) s_req = PLAY_PLAYING;
+  /* 1) player_skip()：EOF/ERROR 之后切歌也要重新进入播放请求 */
+  if (s_req == PLAY_STOPPED || s_req == PLAY_EOF || s_req == PLAY_ERROR)
+      s_req = PLAY_PLAYING;
+
+  /* 2) player_thread() 的 reopen 分支：打开成功后按请求态推进，
+        不能无条件写 PLAYING，也不能让 req 停在旧值 */
+  opened = (req == PLAY_PAUSED) ? PLAY_PAUSED : PLAY_PLAYING;
+  player_enter(opened, 1);
   ```
 
-  可选加固：`player_thread` 的 reopen 分支成功后统一 `s_req = PLAY_PLAYING`，
-  避免以后再加状态时又漏一处。
+  另外把散落的 `s_state = ...` 收敛到 `player_enter(st, set_req)`：
+  写状态加锁、只在变化时发布、终态同时改写 `s_req`。
+- **验证**（`tools/player_regress.py`）：
+
+  ```
+  reached EOF : EOF
+  NEXT reply  : OK NEXT
+  [PASS] D1 EOF 后 NEXT 恢复播放  state=PLAYING pos=650
+  ```
 - **影响面**：T3.4、T5（EOF 后的 LEFT/切线路径）、T7 长时间循环播放。
 
-### D2（缺陷，待修）：暂停后 `state` 不上报 PAUSED
+### D2（已修 2026-11-11）：暂停后 `state` 不上报 PAUSED
 
 - **现象**：`PAUSE` 后位置确实冻结（暂停生效），但 `STATUS`/界面里的 `state` 一直是 `PLAYING`，
   客户端与 LCD 都无法显示"已暂停"。
 - **根因**（`src/player.c`）：`player_thread` 的 `case PLAY_PAUSED:` 只置 `s_state = PLAY_PAUSED`
   就 `continue`，**没有调用 `publish_status()`**；状态快照只在 reopen/EOF/ERROR/播放循环每 8 个周期时发布，
   暂停分支被跳过了。
-- **最小修复**：`case PLAY_PAUSED:` 分支内 `publish_status()` 一次，与 `PLAY_STOPPED` 分支保持一致
-  （同样建议由 player 模块负责人提交）。
+- **修复**：暂停分支改走 `player_enter(PLAY_PAUSED, 0)`——状态变化时发布一次快照，
+  每 20ms 的循环不会重复刷共享内存。
+- **验证**：
+
+  ```
+  [PASS] D2 PAUSE 上报 PAUSED  PAUSED/PAUSED
+  [PASS] D2 暂停期间 pos 冻结  pos 2321 -> 2321
+  [PASS] D2 RESUME 恢复 PLAYING  state=PLAYING pos=4364
+  ```
 - **影响面**：T3.6、T2（LCD 暂停态）、所有远程客户端的 `state` 字段。
-  附带影响：`PUSH` 手势的切换判据用 `player_current_state()`，读的是同一个 `s_state`，
-  所以"暂停后 PUSH 恢复"目前仍能工作——但这依赖内部变量而非上报值，属于隐性耦合。
+
+### D3（已修 2026-11-11）：坏文件/缺素材时 `ERROR` 上报不出来
+
+- **现象**：启动时给一个不存在的 WAV，`STATUS` 一直显示 `state=STOPPED`；
+  即使 `PLAY` 也等不到 `ERROR`，现场无法区分"没加载"与"加载失败"。
+- **根因**（`src/player.c`）：`!s_wav_open` 的打开失败分支把 `s_req` 改成 `PLAY_STOPPED` 且
+  未发布快照；下一轮 `case PLAY_STOPPED` 立即把 `s_state` 覆盖成 `PLAY_STOPPED`，
+  `ERROR` 只存在一瞬。
+- **修复**：
+  1. 所有打开失败路径统一 `player_enter(PLAY_ERROR, 1)`（改状态 + 改请求 + 立即发布）；
+  2. 主循环对 `ERROR` 做粘滞：只有 `PLAY`（`req == PLAYING`）能复位，
+     `PAUSE`/`NEXT` 等不会把错误态"洗掉"；
+  3. `NEXT` 切到另一首可用曲目时经 reopen 分支恢复正常。
+- **验证**：
+
+  ```
+  [PASS] D3 坏文件上报 ERROR  state=ERROR
+  [PASS] D3 ERROR 粘滞（PLAY 仍 ERROR）  state=ERROR
+  [PASS] D3 文件就位后 PLAY 复位  state=PLAYING pos=650
+  ```
+- **影响面**：T3.1 的"无 `PLAY_ERROR`"判据、客户端错误提示、现场"没声音"的归因速度。
 
 ### O1–O6（观察项，不是缺陷）
 
@@ -463,7 +566,7 @@ DEBUG 指令 7 去抖丢弃（0 ms 内重复）
 
 ```bash
 # 0) 上板前（集成机）
-make BOARD=1 CROSS=arm-linux-gnueabihf-
+make BOARD=1 CROSS=arm-linux-
 readelf -h build/gesture_audio | grep Machine          # 要 ARM
 
 # 1) 自检（板子或主机都行）
@@ -488,10 +591,10 @@ python tools/netctl.py <板子IP> "VOL 80"               # 2.4 秒时发
 ./gesture_audio --run 300 --port 8888 --log info audio/test_30s.wav
 ```
 
-## 附录 A：Windows 开发机（无 sh.exe）编译命令
+## 附录 A：Windows 开发机（无 sh.exe / 无 gcc）编译命令
 
 ```powershell
-# 主机版（BOARD=0）
+# 主机版（BOARD=0）——有 MinGW gcc 时
 gcc -std=gnu99 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -DBOARD=0 -D_GNU_SOURCE -pthread `
     src/*.c -o build/gesture_audio.exe -pthread -lm -lws2_32
 
@@ -499,7 +602,17 @@ gcc -std=gnu99 -O2 -Wall -Wextra -Wno-unused-parameter -Iinclude -DBOARD=0 -D_GN
 gcc -O2 -Wall -Wextra -o build/gen_wav.exe tools/gen_wav.c -lm
 ```
 
-（这是本机实测用的命令，`-Wall -Wextra` 零警告；`BOARD=1` 在本机编不了，缺 ALSA 头与交叉编译器。）
+2026-11-11 本机没有 gcc/MinGW、也不能装 WSL，改用**便携 Zig**（`py -3.11 -m pip install ziglang`，
+不写注册表、不动系统 PATH）做主机回归，等价命令：
+
+```powershell
+$zig = (py -3.11 -c "import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),'zig.exe'))")
+$src = (Get-ChildItem src\*.c).FullName
+& $zig cc -std=gnu99 -O2 -g -Wall -Wextra -Wno-unused-parameter -Iinclude -DBOARD=0 -D_GNU_SOURCE -pthread `
+    $src -o build\gesture_audio.exe -lws2_32 -lm -lpthread
+```
+
+（两条路都实测零警告；`BOARD=1` 在本机编不了，缺 ALSA 头与交叉编译器——那一步在 Ubuntu VM 做。）
 
 ## 附录 B：测试记录表（复制到现场记录）
 
@@ -512,9 +625,10 @@ gcc -O2 -Wall -Wextra -o build/gen_wav.exe tools/gen_wav.c -lm
 | T3.1 全链路 | | | 丢弃数 | |
 | T3.2 真机出声 | | | und | |
 | T3.3 EOF | | | pos/len | |
-| T3.4 EOF 后切歌 | | | | D1 已知 |
+| T3.4 EOF 后切歌 | | | | D1 已修，主机回归通过 |
 | T3.5 变速 | | | speed | |
-| T3.6 暂停/恢复 | | | pos 是否冻结 | D2 已知 |
+| T3.6 暂停/恢复 | | | pos 是否冻结 | D2 已修，主机回归通过 |
+| T3.8 坏文件 ERROR（新增） | | | state 是否粘滞 | D3 已修，主机回归通过 |
 | T3.7 回声/EQ | | | | |
 | T4.1 协议矩阵 | | | ERR 条数 | |
 | T4.2 连接上限 | | | 保持条数 | |

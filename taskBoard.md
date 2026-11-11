@@ -5,6 +5,11 @@
 > `testGuide.md`（T0–T7 板端用例）、`boardGuide.md`（板端硬件事实）、`AGENT.md §0.5/§0.6`（留痕与 git 命令）。
 > 维护：Lead 汇总初稿，组长评审后发布；任务状态由 owner 当日更新，**任务板不替代 git issue**。
 
+> **2026-11-11 22:5x 实测修正**：板端 `/lib/ld-linux.so.3` + glibc 2.23 → **软浮点**，
+> VM 厂商工具链 `arm-linux-gcc`（`arm-none-linux-gnueabi`）正确；本文件里所有
+> `gnueabihf` / `ld-linux-armhf.so.3` 的描述作废，以 `boardGuide.md §2.5` 与
+> `ubuntuArmBuild.md` 为准。另：板端**没有 libasound**，M1 音频验收需先补库（§3.3.1）。
+
 ---
 
 ## 0. 先看结论
