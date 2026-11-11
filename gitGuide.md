@@ -125,19 +125,173 @@ git push origin --delete feat/sensor # 删远程
 
 ## 5. GitHub 网页端设置（必须做，否则纪律靠自觉）
 
-进入 `https://github.com/Fe1ixFe1icis/gec6818-gesture-audio`：
+进入 `https://github.com/Fe1ixFe1icis/gec6818-gesture-audio`。
 
-1. **Settings → General → Danger Zone → Change visibility**：确认是 **Private**（`devFlow.md` 要求）。
-2. **Settings → Collaborators → Add people**：把全组 GitHub 账号加成 collaborator，权限用 `Write`（不要给 Admin，避免有人绕过保护）。
-3. **Settings → Branches → Add branch protection rule**，对 `main` 勾选：
-   - ✅ Require a pull request before merging（Require approvals = 1）
-   - ✅ Do not allow bypassing the above settings
-   - ✅ Do not allow force pushes
-   - ✅ Do not allow deletions
-4. 同样给 `dev` 加一条（可放宽为「禁止 force push / 禁止删除」即可，允许直接 push 便于集成）。
-5. **Settings → General → Default branch**：建议改成 `dev`，这样新建 PR 默认指向集成分支而不是 `main`。
+### 5.1 邀请组员进入仓库（Collaborator）
 
-> 注意顺序：**先 push 首次提交（第 2、3 节），再开保护规则**。开了保护后 `main` 就只能走 PR 了。
+单仓库协作，组员直接加成 **Collaborator** 即可，**不要用 Fork**（私有仓库 fork 后各写各的，PR 流向会乱）。
+
+**组长操作**：
+
+1. 仓库页 → 上方 **Settings**（Tab）→ 左侧 **Access → Collaborators**
+   - 新版界面在 **Settings → Collaborators and teams**，效果一样
+2. 点绿色 **Add people**
+3. 输入组员的 **GitHub 用户名**（不是 QQ/微信昵称），或对方 GitHub 账号绑定的邮箱
+   - 不确定用户名：让对方打开自己主页，把地址栏 `github.com/<用户名>` 发给你
+4. 选角色 → **Write**
+   - `Read`：只能看和 clone，不能 push
+   - **`Write`：可以 push 分支、开 PR** ← 组员统一用这个
+   - `Admin`：能改设置、能删仓库、能绕过分支保护 ← **不要给**
+5. **Add** → 发出邀请（对方需在 7 天内接受，过期可点 **Resend invitation**）
+
+**组员操作（接受邀请）**：
+
+- 邮箱里点 `View invitation` → **Accept invitation**；或直接打开
+  `https://github.com/Fe1ixFe1icis/gec6818-gesture-audio/invitations` → Accept
+- 接受后仓库会出现在个人仓库列表，可正常 clone / push 分支
+
+**关键提醒**：
+
+- 必须有 **GitHub 账号**；没有就注册（用常用邮箱，并把这个邮箱填进 `git config user.email`，否则提交归属不对）
+- 账号要开 2FA 的话，push 时用 **PAT** 而不是密码（见 §3 常见失败 2）
+- 免费账号的私有仓库 **协作者人数不限**，不需要付费升级
+- 集成机是公用的：不要在集成机上提交代码，只 `pull`。提交一律在自己机器上做
+
+**可选：用 gh CLI 批量邀请**（装了 GitHub CLI 才可用，命令请自己执行）
+
+```bash
+gh auth login
+
+# 单个邀请，permission 可选 pull / triage / push / maintain / admin
+gh api -X PUT repos/Fe1ixFe1icis/gec6818-gesture-audio/collaborators/<组员用户名> -f permission=push
+
+# 查看已发出/已接受的邀请
+gh api repos/Fe1ixFe1icis/gec6818-gesture-audio/invitations
+
+# 查看当前协作者
+gh api repos/Fe1ixFe1icis/gec6818-gesture-audio/collaborators --jq '.[].login'
+```
+
+**组员多或需要长期管理**：可以建一个 **Organization**（免费版即可），把仓库转进去，建 Team 一次性授权 `Write`，以后加人只改 Team 成员，不用逐个仓库点。
+
+### 5.2 确认可见性
+
+**Settings → General → Danger Zone → Change visibility**：必须是 **Private**（`devFlow.md §1` 要求）。
+自检：退出登录（或用无痕窗口）访问仓库地址，应显示 404 —— 能打开就说明公开了，立刻改回 Private。
+
+### 5.3 分支保护：Rulesets（推荐，取代经典 Branch protection）
+
+#### 先确认能不能用（关键坑）
+
+Rulesets 的官方可用范围：**公共仓库**（Free 及以上）；**私有仓库** 需要 `Pro / Team / Enterprise`。经典 Branch protection 规则同理。
+
+本项目是私有仓库，因此在 Free 账号下会出现「Settings 里根本找不到 Rulesets」或保存后不生效。先验证：
+
+```bash
+gh api repos/Fe1ixFe1icis/gec6818-gesture-audio/rulesets
+```
+
+- 返回 `[]` 或规则集列表 → 可用，直接配置
+- 返回 `403 Upgrade to GitHub Pro or make this repository public` → 不可用，先做下面二选一：
+
+| 方案 | 做法 | 说明 |
+|---|---|---|
+| **A（推荐）** | 申请 **GitHub Student Developer Pack**（学生认证，需要学信网/校园邮箱/学生证）→ 账号升级 **Pro** | 免费，私有仓库的 Rulesets / 分支保护全部解锁；学生团队首选 |
+| **B** | 仓库改为 **Public** | 立刻可用，但 `devFlow.md` 要求 Private，需全组同意；实习项目代码一般无敏感信息，属于可接受折中 |
+
+> 若两个方案都暂时做不到，退化方案见本节末尾「无付费方案时的兜底」。
+
+#### 配置 main 分支规则集
+
+路径：仓库 → **Settings** → 左侧 **Code, planning, and automation → Rulesets → Rulesets** → **New ruleset** → **New branch ruleset**
+
+| 配置项 | 取值 |
+|---|---|
+| Ruleset Name | `protect-main` |
+| Enforcement status | 先 `Evaluate`（只观测不拦截），确认无误后改 `Active` |
+| **Bypass list** | **留空**（不添加 Repository admin）。加了人就能绕过保护，等于没开；确需应急通道时给 admin 并选 `For pull requests only` |
+| **Target branches** | `Add a target` → `Include by pattern` → 填 `main`（也可用特殊值 `~DEFAULT_BRANCH` 指向默认分支） |
+
+**Branch protections** 勾选：
+
+- ✅ **Restrict deletions**（禁止删分支，默认已勾）
+- ✅ **Block force pushes**（禁止强推，红线要求）
+- ✅ **Require a pull request before merging**
+  - Required approvals: **1**
+  - ✅ Dismiss stale pull request approvals when new commits are pushed
+  - ✅ Require conversation resolution before merging
+- ✅ **Require linear history**（配合 PR 用 Squash and merge，历史干净，`dev` 回滚方便）
+- ⬜ Require status checks to pass（现在没有 CI，等 M3 之后有构建脚本再加）
+- ⬜ Require signed commits（学生组不建议，配密钥+全员签名成本高）
+- ⬜ Require deployments to succeed（无部署环境，不选）
+
+点 **Create**。
+
+#### 配置 dev 分支规则集
+
+再建一个 **New branch ruleset**：
+
+| 配置项 | 取值 |
+|---|---|
+| Ruleset Name | `protect-dev` |
+| Enforcement status | `Active` |
+| Target branches | `Include by pattern` → `dev` |
+| Branch protections | 只勾 ✅ **Restrict deletions** + ✅ **Block force pushes**（**不勾** Require a pull request，`devFlow.md` 允许向 `dev` 直接 push 做集成） |
+
+两个 ruleset 可同时生效、互不干扰 —— 这是 Rulesets 相对经典保护的最大好处（经典保护一条分支只能挂一套规则）。GitHub 侧所有适用的 ruleset 会**叠加执行**。
+
+#### 生效验证
+
+```bash
+# 1. 在 main 上直接推送（预期被拒：protected branch hook declined / GH013）
+git checkout main
+git commit --allow-empty -m "chore: 测试保护"
+git push origin main
+
+# 2. 强推 main（预期被拒）
+git push --force origin main
+
+# 3. 页面查看当前生效规则集：仓库首页 → Insights 旁的 "Rulesets" 或 Settings → Rulesets
+```
+
+第 1、2 条被拒就是配置成功。测试用的空提交记得清掉：`git reset --hard origin/main`。
+
+#### Rulesets 与经典 Branch protection 的区别
+
+| 维度 | Rulesets | 经典 Branch protection |
+|---|---|---|
+| 一条分支可同时套用 | ✅ 多套叠加 | ❌ 只能一套 |
+| 可临时停用 | ✅ 改 Enforcement 为 Disabled，规则保留 | ❌ 只能删掉重配 |
+| 只读可见 | ✅ 有读权限即可查看，低于管理员可审计 | ❌ 需 admin |
+| 目标写法 | fnmatch 模式（`main`、`release/**`、`~ALL`） | 固定分支名 |
+| 额外能力 | 限制 commit message / 分支名 / 作者邮箱 | 无 |
+| Free + 私有仓库 | ❌ 不可用 | ❌ 不可用 |
+
+**如果暂时只能用经典 Branch protection**（同样需要 Pro）：**Settings → Rules → Branches → Add branch protection rule**，Branch name pattern 填 `main`，勾选项与上表一致。
+
+#### 无付费方案时的兜底
+
+GitHub 侧没有强制力，只能靠本地钩子 + 纪律：
+
+```bash
+# 在仓库根目录放 .git/hooks/pre-push，阻止直接推 main（本地生效，可被手工绕过）
+# 注意：hooks 不进版本库，每人自己装一次；或用 core.hooksPath 指向仓库内 .githooks 目录统一管理
+git config core.hooksPath .githooks
+```
+
+钩子内容要点：读 stdin 的 `<local ref> <local sha> <remote ref> <remote sha>`，若 `remote ref` 为 `refs/heads/main` 则 `exit 1` 并打印提示。这只能防手误，防不了故意绕过，所以**最终仍需 A/B 方案**。
+
+### 5.4 默认分支
+
+**Settings → General → Default branch**：建议改成 `dev`，这样新建 PR 默认指向集成分支而不是 `main`。
+
+### 5.5 邀请完成后的验证清单
+
+- [ ] 组员在 `github.com/Fe1ixFe1icis/gec6818-gesture-audio` 能看到仓库（无痕窗口看不到，说明 Private 正常）
+- [ ] 组员能 `git clone` 成功
+- [ ] 组员本地 `git config user.email` 与自己 GitHub 账号邮箱一致
+- [ ] 组员能创建并 push 一个 `feat/xxx` 分支（验证 Write 权限真的给到了）
+- [ ] 组员不能 push 到 `main`（验证分支保护生效，报 `protected branch hook declined` 属正常）
 
 ---
 
@@ -206,7 +360,11 @@ scope: sensor | player | effect | display | server | proto | build
 
 ---
 
-## 9. PR（合并进 dev）
+## 9. 合并：功能分支 → dev → main
+
+两条路径、两种合并方式，**不能混用**。搞错会在下次发布时重复解决同一批冲突。
+
+### 9.1 功能分支合并进 dev（日常，高频）
 
 ```bash
 # 网页操作：Compare & pull request → base 选 dev ← compare 选 feat/xxx
@@ -219,7 +377,91 @@ git log --oneline dev..feat/xxx
 git diff dev...feat/xxx --stat
 ```
 
-合并后按第 4 节删除功能分支。合并方式建议 **Squash and merge**，保持 `dev` 历史干净。
+合并方式：**Squash and merge**（功能分支里的 WIP 提交压成一个，`dev` 历史干净）。合并后按第 4 节删除功能分支。
+
+### 9.2 dev 合并进 main（里程碑发布，低频）
+
+**时机**：只按 `projectBrief.md §7` 的里程碑节点合（M1…M7），不是每天/每周。`main` 必须始终是可运行版本。
+
+前提：`dev` 已完成联调、能编译、板子上跑通过。
+
+```bash
+# 1. 确认 dev 最新，并看清这次要发布什么
+git checkout dev
+git pull --rebase
+git log --oneline main..dev          # 预期：列出本次将进入 main 的全部提交
+
+# 2. 网页建 PR：Pull requests → New pull request
+#    base: main   ←   compare: dev
+#    标题：release: M2 传感器采集交付
+#    描述：里程碑清单 + 已验证项 + 已知问题
+```
+
+3. 合并方式选 **Create a merge commit**，点 **Merge pull request**（原因见 9.3）
+4. 打 tag 标记版本（便于回退与答辩追溯）：
+
+```bash
+git checkout main
+git pull
+git tag -a v0.2-m2 -m "M2 传感器采集：I2C 手势读取 + 滑动平均滤波"
+git push origin v0.2-m2
+```
+
+### 9.3 合并方式怎么选（关键，别搞反）
+
+| 合并路径 | 方式 | 原因 |
+|---|---|---|
+| `feat/*` → `dev` | **Squash and merge** | WIP 提交多且碎，压成一个提交，`dev` 历史可读 |
+| `dev` → `main` | **Create a merge commit** | `dev` 成为 `main` 的祖先，下次发布历史连续、不重复冲突 |
+
+⚠️ **最常见的坑**：`dev → main` 若也用 Squash，GitHub 会在 `main` 上生成一个**全新提交**，与 `dev` 历史无血缘关系。下次再发 PR 时，GitHub 认为 `dev` 里那些提交「从未合并过」，会把上次已发布的内容全部重新列出，冲突重复出现、Review 无从下手。所以 `dev → main` 必须用 merge commit。
+
+### 9.4 PR 显示冲突了怎么办
+
+在自己分支上解决，**不要在网页上乱点 resolve**（容易解出语义错误）：
+
+```bash
+git checkout dev
+git fetch origin
+git merge origin/main          # 与 git rebase origin/main 二选一，组内统一，不要混用
+# 解决冲突文件 → git add <文件> → git commit（若用 rebase 则 git rebase --continue）
+git push origin dev
+```
+
+推上去后 PR 页面的冲突提示自动消失。冲突解决原则：`main` 是已发布版本，**优先保留 main 的稳定行为**，`dev` 的新逻辑以补丁方式叠加。
+
+### 9.5 合并后发现问题要回滚
+
+```bash
+# 网页：打开那个 PR → 右下 Revert（生成一个反向 PR，同样走审批）—— 推荐
+# 命令行等价：
+git checkout main
+git pull
+git revert -m 1 <merge-commit-hash>    # -m 1 = 保留第一父（main 主线）
+git push origin main                   # 若已开保护，改用 revert 分支 + PR
+```
+
+**禁止** `git reset --hard` 后强推 `main` —— `devFlow.md §7` 红线。
+
+### 9.6 hotfix：main 出紧急问题
+
+```bash
+git checkout -b fix/main-audio-crash main   # 从 main 切，不从 dev 切
+# 修完 → PR 到 main（base: main）→ 合并
+# 然后必须回流到 dev，否则下次发布会覆盖掉修复：
+git checkout dev && git merge origin/main && git push origin dev
+```
+
+### 9.7 还没开分支保护时（Free 私有仓库的退化情况）
+
+本地直推 `main` 技术上可行，但**仍建议走 PR**：PR 留下「谁改了什么、谁看过」的记录，也是 `devFlow.md §2.3` 的要求。确实要本地合时：
+
+```bash
+git checkout main
+git pull
+git merge --no-ff dev -m "release: M2 传感器采集交付"    # --no-ff 保留合并节点，便于回滚
+git push origin main
+```
 
 ---
 
@@ -256,7 +498,56 @@ git diff dev...feat/xxx --stat
 
 ---
 
+## 12. AI 输出命令清单的标准格式
+
+> 依据 `AGENT.md §0.6`：AI 每次操作后必须按本节格式输出命令清单，由操作人手动执行。
+> 本节即"命令模板"的唯一出处，`AGENT.md` 只引用不重复。
+
+### 12.1 必须包含的五要素
+
+| 要素 | 说明 |
+|---|---|
+| 执行位置 | 本机 Git Bash / Ubuntu 虚拟机 / 集成机，写清哪一台 |
+| 目标分支 | 当前应在哪个分支上执行，不对就先切 |
+| 逐一点名的 `git add` | 禁止 `-A`（初始化首提除外） |
+| 现成的 commit message | 按 Conventional Commits，可直接用 |
+| 预期输出 + 失败处理 | 被拒/冲突时下一步怎么办 |
+
+### 12.2 模板
+
+```bash
+# 执行位置：本机 Git Bash ｜ 目标分支：feat/effect
+git status                              # 预期：只列出本次改动的文件
+git add src/effect.c include/effect.h    # 逐一点名，不要用 -A
+git diff --cached --stat                # 预期：2 files changed
+git commit -m "feat(effect): 实现回声延迟环形缓冲区"
+git push origin feat/effect             # 若报 non-fast-forward → git pull --rebase 后重推
+```
+
+### 12.3 反面例子（不要这样）
+
+```bash
+# ❌ 没有具体命令，全靠猜
+你可以提交一下这次的改动。
+
+# ❌ 盲加，容易把 *.o / app 带进仓库
+git add -A && git commit -m "update"
+
+# ❌ 一个 commit 干三件事
+git add -A && git commit -m "改了 sensor、修了 EQ、顺手改了 README"
+```
+
+### 12.4 特殊情况
+
+- **本次无文件改动**：直接写「本次无文件改动，无需 git 操作」，不要凑命令。
+- **仓库初始化首提**：允许 `git add -A`（此时工作区无可误加的产物），但仍需先 `git status` 扫一眼。
+- **只改了文档**：`type` 用 `docs` 或 `chore`，`scope` 可省，如 `docs: 补充 boardGuide 触摸校准步骤`。
+- **需要占位符**：如组员用户名、板子 IP，必须注明"此处需你填写，因为 AI 无法获知"。
+
+---
+
 ## 附：本仓库 AI 协作铁律
 
 > **所有 git 操作给我指南，你不允许单独操作。**（详见 `AGENT.md §0`）
+> **每次操作后必须按 `AGENT.md §0.6` 输出本次的 git 命令清单，由操作人手动执行。**
 > AI 只输出命令清单，提交、推送、合并、解决冲突一律由人类执行。
