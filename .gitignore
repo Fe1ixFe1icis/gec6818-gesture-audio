@@ -53,3 +53,36 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# ===== 本项目补充（GEC6818 交叉编译 / 音频资源）=====
+# 构建输出目录
+build/
+bin/
+obj/
+out/
+
+# 交叉编译产出的可执行文件（无扩展名，Linux 侧生成）
+/app
+/gesture_audio
+/main
+
+# 音频素材体积大，走 NFS / 网盘共享，不进仓库
+*.wav
+*.mp3
+*.flac
+*.aac
+
+# 板端日志、抓包、固件镜像
+*.log
+*.pcap
+*.img
+
+# NFS 挂载/共享目录
+nfs/
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

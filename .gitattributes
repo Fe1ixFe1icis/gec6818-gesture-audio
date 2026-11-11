@@ -1,0 +1,22 @@
+# 统一换行符：仓库内存 LF，Windows 检出时不自动转换（配合 core.autocrlf=false）
+* text=auto eol=lf
+
+# 源码与脚本：强制 LF，避免交叉编译时出现 ^M 报错
+*.c      text eol=lf
+*.h      text eol=lf
+*.sh     text eol=lf
+Makefile text eol=lf
+*.md     text eol=lf
+
+# Windows 侧脚本保留 CRLF
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+
+# 二进制文件不参与换行符处理，且 git diff 视为二进制
+*.png    binary
+*.jpg    binary
+*.bmp    binary
+*.wav    binary
+*.mp3    binary
+*.flac   binary
+*.bin    binary
