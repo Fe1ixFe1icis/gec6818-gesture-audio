@@ -86,3 +86,6 @@ nfs/
 *.swp
 .DS_Store
 Thumbs.db
+
+# AI 工具工作目录（会话记忆、临时中间产物，属于个人环境，不进团队仓库）
+.workbuddy/
