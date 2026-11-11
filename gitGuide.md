@@ -360,7 +360,11 @@ scope: sensor | player | effect | display | server | proto | build
 
 ---
 
-## 9. PR（合并进 dev）
+## 9. 合并：功能分支 → dev → main
+
+两条路径、两种合并方式，**不能混用**。搞错会在下次发布时重复解决同一批冲突。
+
+### 9.1 功能分支合并进 dev（日常，高频）
 
 ```bash
 # 网页操作：Compare & pull request → base 选 dev ← compare 选 feat/xxx
@@ -373,7 +377,91 @@ git log --oneline dev..feat/xxx
 git diff dev...feat/xxx --stat
 ```
 
-合并后按第 4 节删除功能分支。合并方式建议 **Squash and merge**，保持 `dev` 历史干净。
+合并方式：**Squash and merge**（功能分支里的 WIP 提交压成一个，`dev` 历史干净）。合并后按第 4 节删除功能分支。
+
+### 9.2 dev 合并进 main（里程碑发布，低频）
+
+**时机**：只按 `projectBrief.md §7` 的里程碑节点合（M1…M7），不是每天/每周。`main` 必须始终是可运行版本。
+
+前提：`dev` 已完成联调、能编译、板子上跑通过。
+
+```bash
+# 1. 确认 dev 最新，并看清这次要发布什么
+git checkout dev
+git pull --rebase
+git log --oneline main..dev          # 预期：列出本次将进入 main 的全部提交
+
+# 2. 网页建 PR：Pull requests → New pull request
+#    base: main   ←   compare: dev
+#    标题：release: M2 传感器采集交付
+#    描述：里程碑清单 + 已验证项 + 已知问题
+```
+
+3. 合并方式选 **Create a merge commit**，点 **Merge pull request**（原因见 9.3）
+4. 打 tag 标记版本（便于回退与答辩追溯）：
+
+```bash
+git checkout main
+git pull
+git tag -a v0.2-m2 -m "M2 传感器采集：I2C 手势读取 + 滑动平均滤波"
+git push origin v0.2-m2
+```
+
+### 9.3 合并方式怎么选（关键，别搞反）
+
+| 合并路径 | 方式 | 原因 |
+|---|---|---|
+| `feat/*` → `dev` | **Squash and merge** | WIP 提交多且碎，压成一个提交，`dev` 历史可读 |
+| `dev` → `main` | **Create a merge commit** | `dev` 成为 `main` 的祖先，下次发布历史连续、不重复冲突 |
+
+⚠️ **最常见的坑**：`dev → main` 若也用 Squash，GitHub 会在 `main` 上生成一个**全新提交**，与 `dev` 历史无血缘关系。下次再发 PR 时，GitHub 认为 `dev` 里那些提交「从未合并过」，会把上次已发布的内容全部重新列出，冲突重复出现、Review 无从下手。所以 `dev → main` 必须用 merge commit。
+
+### 9.4 PR 显示冲突了怎么办
+
+在自己分支上解决，**不要在网页上乱点 resolve**（容易解出语义错误）：
+
+```bash
+git checkout dev
+git fetch origin
+git merge origin/main          # 与 git rebase origin/main 二选一，组内统一，不要混用
+# 解决冲突文件 → git add <文件> → git commit（若用 rebase 则 git rebase --continue）
+git push origin dev
+```
+
+推上去后 PR 页面的冲突提示自动消失。冲突解决原则：`main` 是已发布版本，**优先保留 main 的稳定行为**，`dev` 的新逻辑以补丁方式叠加。
+
+### 9.5 合并后发现问题要回滚
+
+```bash
+# 网页：打开那个 PR → 右下 Revert（生成一个反向 PR，同样走审批）—— 推荐
+# 命令行等价：
+git checkout main
+git pull
+git revert -m 1 <merge-commit-hash>    # -m 1 = 保留第一父（main 主线）
+git push origin main                   # 若已开保护，改用 revert 分支 + PR
+```
+
+**禁止** `git reset --hard` 后强推 `main` —— `devFlow.md §7` 红线。
+
+### 9.6 hotfix：main 出紧急问题
+
+```bash
+git checkout -b fix/main-audio-crash main   # 从 main 切，不从 dev 切
+# 修完 → PR 到 main（base: main）→ 合并
+# 然后必须回流到 dev，否则下次发布会覆盖掉修复：
+git checkout dev && git merge origin/main && git push origin dev
+```
+
+### 9.7 还没开分支保护时（Free 私有仓库的退化情况）
+
+本地直推 `main` 技术上可行，但**仍建议走 PR**：PR 留下「谁改了什么、谁看过」的记录，也是 `devFlow.md §2.3` 的要求。确实要本地合时：
+
+```bash
+git checkout main
+git pull
+git merge --no-ff dev -m "release: M2 传感器采集交付"    # --no-ff 保留合并节点，便于回滚
+git push origin main
+```
 
 ---
 
