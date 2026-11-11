@@ -9,8 +9,10 @@
 # 说明：
 #   - BOARD=1 时链接 ALSA；BOARD=0 时不依赖任何硬件库，便于在无板环境
 #     验证「采集 → 仲裁 → 播放 → 显示 → 网络」全链路。
-#   - 交叉编译器前缀必须与板上 ABI 一致（硬浮点 → gnueabihf），
-#     混用 gnueabi 会在板上报 "No such file or directory"，见 boardGuide.md §2.5。
+#   - 交叉编译器前缀必须与板上 ABI 一致。本板实测软浮点
+#     （/lib/ld-linux.so.3 + glibc 2.23）→ 用 arm-linux-gcc（arm-none-linux-gnueabi）；
+#     用 gnueabihf 编出的程序会要求 /lib/ld-linux-armhf.so.3，板上报
+#     "No such file or directory"，见 boardGuide.md §2.5。
 # =====================================================================
 CROSS   ?=
 BOARD   ?= 0
@@ -18,6 +20,7 @@ BUILD   := build
 HOSTCC  ?= cc
 
 CC      := $(CROSS)gcc
+READELF ?= $(CROSS)readelf
 SRCS    := $(wildcard src/*.c)
 OBJS    := $(patsubst src/%.c,$(BUILD)/%.o,$(SRCS))
 TARGET  := $(BUILD)/gesture_audio
@@ -27,8 +30,18 @@ CFLAGS  += -Iinclude -DBOARD=$(BOARD) -D_GNU_SOURCE -pthread
 LDFLAGS := -pthread
 LDLIBS  := -lm
 
+# ALSA 头文件/库的位置。默认走交叉工具链的 sysroot（最省事）；
+# 若工具链 sysroot 缺 ALSA 开发包，可在命令行覆盖，把板端库和头文件指进来：
+#   make BOARD=1 CROSS=arm-linux-gnueabihf- \
+#        ALSA_CFLAGS="-I$HOME/alsa/usr/include" \
+#        ALSA_LIBS="-L$HOME/alsa/usr/lib/arm-linux-gnueabihf -l:libasound.so.2"
+# 详见 ubuntuArmBuild.md §4。
+ALSA_CFLAGS ?=
+ALSA_LIBS   ?= -lasound
+
 ifeq ($(BOARD),1)
-LDLIBS  += -lasound
+CFLAGS  += $(ALSA_CFLAGS)
+LDLIBS  += $(ALSA_LIBS)
 endif
 
 ifeq ($(OS),Windows_NT)
@@ -61,10 +74,28 @@ tools: | $(BUILD)
 selftest: $(TARGET)
 	$(TARGET) --selftest
 
+# 交叉编译快捷入口（Ubuntu 集成机）：make arm CROSS=arm-linux-gnueabihf-
+arm:
+	@if [ -z "$(CROSS)" ]; then \
+	  echo "错误：CROSS 为空。示例：make arm CROSS=arm-linux-gnueabihf-"; \
+	  exit 2; \
+	fi
+	@$(MAKE) BOARD=1 CROSS=$(CROSS)
+
+# 产物 ABI/依赖校验（必须在 Ubuntu/交叉工具链侧跑；Windows 无 readelf）
+verify: $(TARGET)
+	@echo "== 产物校验：$(TARGET) =="
+	@$(READELF) -h $(TARGET) | grep -E "Class:|Machine:"
+	@$(READELF) -A $(TARGET) 2>/dev/null | grep -E "Tag_ABI_VFP_args|Tag_CPU_arch" || true
+	@$(READELF) -l $(TARGET) | grep -E "interpreter" || true
+	@$(READELF) -d $(TARGET) | grep -E "NEEDED" || true
+	@echo "-- GLIBC 符号版本（板端必须 >= 这些值）--"
+	@$(READELF) --version-info $(TARGET) | grep -o "GLIBC_[0-9.]*" | sort -u || true
+
 clean:
 	@$(RMDIR)
 	@echo "== cleaned: $(BUILD)/ =="
 
 -include $(wildcard $(OBJS:.o=.d))
 
-.PHONY: all tools selftest clean
+.PHONY: all tools selftest arm verify clean

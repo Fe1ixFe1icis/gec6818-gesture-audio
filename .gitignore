@@ -77,6 +77,15 @@ out/
 *.pcap
 *.img
 
+# 导入 Ubuntu 的打包产物（由 tools/pack_for_ubuntu.ps1 生成）
+dist/
+*.tar.gz
+*.sha256
+
+# Python 工具缓存（tools/*.py）
+__pycache__/
+*.pyc
+
 # NFS 挂载/共享目录
 nfs/
 

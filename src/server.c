@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>      /* strcasecmp：glibc 不在 string.h 里声明，漏了会隐式声明 */
 #include <ctype.h>
 #include <stdarg.h>
 

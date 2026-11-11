@@ -477,6 +477,7 @@ static void fb_close(void)
 }
 #endif /* BOARD */
 
+#if !defined(BOARD) || !BOARD
 /* 主机模拟：一行仪表，便于 grep / 重定向进日志对比 */
 static void emit_ascii(const status_t *st)
 {
@@ -494,6 +495,7 @@ static void emit_ascii(const status_t *st)
          t1, t2, st->track_index + 1, st->track_count,
          st->clients, st->underruns, gesture_name(st->gesture), st->distance_mm);
 }
+#endif
 
 int display_init(void)
 {

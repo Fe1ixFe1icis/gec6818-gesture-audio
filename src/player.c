@@ -179,10 +179,21 @@ static int alsa_open(void)
     unsigned int rate = (unsigned int)s_rate;
     snd_pcm_uframes_t period = AUDIO_PERIOD_FRAMES;
     snd_pcm_uframes_t buffer = AUDIO_BUFFER_FRAMES;
+    /* 设备回退链：板端可能缺 /usr/share/alsa 配置树，default/plughw 依赖配置，
+     * 而 hw:0,0 是 libasound 内置插件、不读配置文件。 */
+    static const char *devs[] = { "default", "plughw:0,0", "hw:0,0" };
+    int i;
 
-    if (snd_pcm_open(&s_pcm, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) {
-        LOGE(TAG, "ALSA 打开失败（设备可能被 Qt/madplay 占用，或 /dev/snd 不存在）");
+    s_pcm = NULL;
+    for (i = 0; i < (int)(sizeof devs / sizeof devs[0]); i++) {
+        if (snd_pcm_open(&s_pcm, devs[i], SND_PCM_STREAM_PLAYBACK, 0) == 0) {
+            LOGT(TAG, "ALSA 设备：%s", devs[i]);
+            break;
+        }
         s_pcm = NULL;
+    }
+    if (!s_pcm) {
+        LOGE(TAG, "ALSA 打开失败（default/plughw/hw 均不可用；查 /dev/snd 与占用）");
         return -1;
     }
     snd_pcm_hw_params_malloc(&hw);
@@ -250,6 +261,7 @@ static int alsa_write(const int16_t *buf, int frames)
 }
 #endif /* BOARD */
 
+#if !defined(BOARD) || !BOARD
 /* 空 sink：按墙上时钟推进，模拟真实播放节奏（主机验证用） */
 static void null_sink_pace(int frames)
 {
@@ -263,6 +275,7 @@ static void null_sink_pace(int frames)
         os_sleep_ms(wait > 0 ? wait : 0);
     }
 }
+#endif
 
 /* ================= 源读取与重采样 ================= */
 static int src_refill(void)
@@ -473,7 +486,12 @@ int player_skip(int dir)
         if (idx >= g_app.track_count) idx = 0;
         s_track_index = idx;
         s_reopen = 1;
-        if (s_req == PLAY_STOPPED) s_req = PLAY_PLAYING;
+        /* D1：EOF/ERROR 之后切歌必须重新进入播放请求。
+         * 只认 PLAY_STOPPED 会让 s_req 停在 PLAY_EOF，播放线程下一轮走
+         * case PLAY_EOF 空转，现象就是「state=PLAYING、pos 永远 0、没有声音」。
+         * 暂停中切歌保持暂停，由 reopen 分支按 req 决定是否出声。 */
+        if (s_req == PLAY_STOPPED || s_req == PLAY_EOF || s_req == PLAY_ERROR)
+            s_req = PLAY_PLAYING;
     } else {
         idx = -1;
     }
@@ -486,11 +504,18 @@ static void publish_status(void)
 {
     audio_params_t p;
     status_t *st;
+    play_state_t state;
+
+    /* s_state 由 player_enter 在 s_mtx 内写，这里也必须持锁读，
+     * 否则快照可能拿到撕成一半的状态（显示/网络读到的就是错的）。 */
+    pthread_mutex_lock(&s_mtx);
+    state = s_state;
+    pthread_mutex_unlock(&s_mtx);
 
     params_get(&p);
     st = status_lock();
     st->params       = p;
-    st->state        = s_state;
+    st->state        = state;
     st->track_index  = s_track_index;
     st->track_count  = g_app.track_count;
     st->len_ms       = s_wav.rate > 0
@@ -502,6 +527,32 @@ static void publish_status(void)
     status_unlock();
 }
 
+/*
+ * 统一的状态迁移入口。
+ *
+ * 为什么不能继续各处直接写 s_state：
+ *   - s_state 会被 player_current_state() 跨线程读取，写入必须持 s_mtx；
+ *   - 暂停/错误这类「可见状态」必须在变化的那一刻发布快照，否则 STATUS 与
+ *     LCD 会停在旧值（D2/D3）；
+ *   - 终态（ERROR/EOF）要同时改写 s_req，否则下一轮会被旧请求覆盖或被
+ *     反复重试；过程态（PLAYING/PAUSED）不能改 s_req，否则会吞掉用户
+ *     刚投递的指令。
+ *
+ * publish 只在状态真正变化时发生，暂停循环每 20ms 调用一次也不会刷爆共享内存。
+ */
+static void player_enter(play_state_t st, int set_req)
+{
+    int changed;
+
+    pthread_mutex_lock(&s_mtx);
+    changed = (s_state != st);
+    s_state = st;
+    if (set_req) s_req = st;
+    pthread_mutex_unlock(&s_mtx);
+
+    if (changed) publish_status();
+}
+
 /* ================= 播放线程 ================= */
 void *player_thread(void *arg)
 {
@@ -510,8 +561,7 @@ void *player_thread(void *arg)
 
 #if defined(BOARD) && BOARD
     if (alsa_open() != 0) {
-        s_state = PLAY_ERROR;
-        publish_status();
+        player_enter(PLAY_ERROR, 1);
         LOGE(TAG, "音频设备不可用，播放线程退出（显示/网络/手势仍可用）");
         return NULL;
     }
@@ -530,38 +580,56 @@ void *player_thread(void *arg)
         s_reopen = 0;
         pthread_mutex_unlock(&s_mtx);
 
+        /* D3：ERROR 是粘滞终态，只有 PLAY（req == PLAYING）能复位。
+         * 否则 STOPPED 分支会在下一轮把 ERROR 覆盖成 STOPPED，客户端与界面
+         * 永远看不到错误；PAUSE/NEXT 等指令也不应把错误态“洗掉”。 */
+        if (player_current_state() == PLAY_ERROR &&
+            req != PLAY_PLAYING && !reopen) {
+            os_sleep_ms(20);
+            continue;
+        }
+
         /* 播完后再收到 PLAY，按「从头播放」处理，而不是立刻又判一次 EOF */
-        if (!reopen && req == PLAY_PLAYING && s_state == PLAY_EOF) reopen = 1;
+        if (!reopen && req == PLAY_PLAYING &&
+            player_current_state() == PLAY_EOF) reopen = 1;
 
         if (reopen) {
+            play_state_t opened;
+
             track_close();
-            if (g_app.track_count > 0 && track_open(s_track_index) != 0) {
-                pthread_mutex_lock(&s_mtx);
-                s_state = PLAY_ERROR;
-                s_req = PLAY_STOPPED;
-                pthread_mutex_unlock(&s_mtx);
-                publish_status();
+            if (g_app.track_count <= 0) {
+                player_enter(PLAY_STOPPED, 1);
                 continue;
             }
-            s_state = PLAY_PLAYING;
-            publish_status();
+            if (track_open(s_track_index) != 0) {
+                /* D3：打开失败要留下 ERROR 并发布，不能改成 STOPPED */
+                player_enter(PLAY_ERROR, 1);
+                continue;
+            }
+            /* D1：打开成功后必须把请求态推进到可播放态，否则 req 仍是
+             * PLAY_EOF，下一轮 switch 走 case PLAY_EOF 空转（有状态无声）。
+             * 暂停中切歌仍保持暂停，不擅自出声。 */
+            opened = (req == PLAY_PAUSED) ? PLAY_PAUSED : PLAY_PLAYING;
+            player_enter(opened, 1);
             continue;
         }
 
         switch (req) {
         case PLAY_STOPPED:
-            if (s_state != PLAY_STOPPED) {
+            if (player_current_state() != PLAY_STOPPED) {
                 track_close();
-                s_state = PLAY_STOPPED;
-                publish_status();
+                player_enter(PLAY_STOPPED, 1);
             }
             os_sleep_ms(20);
             continue;
         case PLAY_PAUSED:
-            s_state = PLAY_PAUSED;
+            /* D2：暂停是可见状态，必须在进入时发布一次快照。
+             * player_enter 只在值变化时发布，不会每 20ms 刷共享内存。 */
+            player_enter(PLAY_PAUSED, 0);
             os_sleep_ms(20);
             continue;
         case PLAY_EOF:
+        case PLAY_ERROR:
             os_sleep_ms(20);
             continue;
         default:
@@ -570,15 +638,13 @@ void *player_thread(void *arg)
 
         if (!s_wav_open) {
             if (g_app.track_count == 0) {
-                s_state = PLAY_STOPPED;
+                player_enter(PLAY_STOPPED, 1);
                 os_sleep_ms(50);
                 continue;
             }
             if (track_open(s_track_index) != 0) {
-                pthread_mutex_lock(&s_mtx);
-                s_state = PLAY_ERROR;
-                s_req = PLAY_STOPPED;
-                pthread_mutex_unlock(&s_mtx);
+                /* D3：这里原先也没有发布快照，ERROR 只存在一瞬 */
+                player_enter(PLAY_ERROR, 1);
                 continue;
             }
         }
@@ -588,12 +654,9 @@ void *player_thread(void *arg)
 
         frames = resample(AUDIO_PERIOD_FRAMES, step);
         if (frames <= 0) {
-            pthread_mutex_lock(&s_mtx);
-            s_state = PLAY_EOF;
-            s_req = PLAY_EOF;
-            pthread_mutex_unlock(&s_mtx);
+            /* EOF 同时推进请求态，避免下一轮又拿 PLAYING 反复重开文件 */
+            player_enter(PLAY_EOF, 1);
             LOGT(TAG, "曲目播完（track %d）", s_track_index + 1);
-            publish_status();
             continue;
         }
 
@@ -612,14 +675,14 @@ void *player_thread(void *arg)
 
 #if defined(BOARD) && BOARD
         if (alsa_write(s_out, frames) != 0) {
-            s_state = PLAY_ERROR;
+            player_enter(PLAY_ERROR, 1);
             break;
         }
 #else
         null_sink_pace(frames);
 #endif
 
-        s_state = PLAY_PLAYING;
+        player_enter(PLAY_PLAYING, 0);
         if (++periods % STATUS_EVERY_N_PERIODS == 0) publish_status();
     }
 

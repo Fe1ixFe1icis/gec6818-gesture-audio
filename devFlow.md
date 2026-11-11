@@ -67,7 +67,7 @@ scope: sensor | player | effect | display | server | proto | build
 
 ## 5. 环境与接口纪律
 
-- 编译环境统一：同一版本交叉编译器（arm-linux-gnueabi-gcc）、同一套依赖库，安装步骤见 README，环境差异问题由环境 owner 负责
+- 编译环境统一：同一版本交叉编译器（`arm-linux-gcc` 5.4.0，`arm-none-linux-gnueabi` 软浮点）、同一套依赖库，安装步骤见 README，环境差异问题由环境 owner 负责
 - **接口冻结**：`include/` 下头文件、共享参数结构体、通信协议（projectBrief §6）在 M1 结束前冻结；修改接口必须开 `proto/xxx` 分支并经全员同意
 - 每个模块自带单元测试或最小验证程序（如 effect 模块先在 PC 上用 WAV 离线验证），上板前自测通过
 - 新依赖（第三方库）引入前在群里说明理由，禁止私自拷贝不明来源的二进制
