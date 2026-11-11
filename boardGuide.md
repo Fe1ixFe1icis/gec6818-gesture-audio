@@ -62,7 +62,7 @@
 | 蜂鸣器 | **有源蜂鸣器，GPIO 直驱（非 PWM）** ⚠️ | 可选（提示音） |
 | LED | 电源指示灯 + **4 路可控 LED** | 调试指示 |
 | 传感器 | 重力传感器 MMA8653、红外接收头 HS0038 | 否 |
-| 扩展 | SPI、DVP/CSI 摄像头、SIM/3G、GPS（可选） | 传感器接这里 |
+| 扩展 | **J10：2×10、2.54mm 双排针**，含 3.3V/5V/GND、I2C CH2（pin1/20/8/10）、SPI、ADC、部分 GPIO；另有 DVP/CSI、SIM/3G、GPS | 传感器接 J10 |
 
 ### 1.3 显示与触摸
 
@@ -656,6 +656,12 @@ export ALSA_CONFIG_PATH=/tmp/gapp/usr/share/alsa/alsa.conf
 
 > 板端跑 `ldd ./gesture_audio` 或 `LD_DEBUG=libs` 可确认加载的是哪一份 libasound；
 > `default` 打不开时先查 `ALSA_CONFIG_PATH`，再试 `hw:0,0`。
+>
+> **实测（2026-11-12）**：用 `ALSA_CONFIG_PATH=/tmp/gapp/usr/share/alsa/alsa.conf` 时，
+> `alsa.conf` 里写死的 `/usr/share/alsa/cards/aliases.conf` 不存在，会打印
+> `cannot stat .../cards/aliases.conf` 和 `Unknown PCM cards.pcm.default`；
+> 这是**配置树路径**问题，不是声卡故障。程序回退 `plughw:0,0` 正常出声即可；
+> 根文件系统可写时把 `usr/share/alsa` 铺到 `/usr/share/alsa`，警告会消失、`default` 也可用。
 
 ### 3.4 GPIO
 
@@ -782,6 +788,135 @@ int i2c_read_reg(int fd, unsigned char addr, unsigned char reg,
 - SDA/SCL 需要上拉（模块板通常自带 4.7k，裸芯片要自己加）
 - **不要盲扫整条总线**：触摸屏 gslx680 挂在 I2C 上，某些器件被误探测会进入异常状态
 - 推荐器件（都有成熟 Linux 用户态驱动可抄）：APDS-9960 / PAJ7620（手势）、VL53L0X（激光测距）、MPU6050（姿态）
+
+#### 3.5.1 本板 I2C“排针”怎么确认（M2 前置）
+
+**✅ 已从原理图确认（2026-11-12）**：底板 `gec6818_base_V1.1` P11 的 **J10**
+（2×10、2.54mm 双排针，旁注 `UART/SPI/ADC`）直接引出 I2C CH2：
+
+| J10 引脚 | 网络 | 用途 |
+|---|---|---|
+| **pin 1** | `VCC3P3_SYS` | **3.3V** |
+| pin 2 | `VDD_5V` | 5V，**不要接传感器** |
+| **pin 8** | `MCU_SCL_2` | **SCL（I2C CH2）** |
+| **pin 10** | `MCU_SDA_2` | **SDA（I2C CH2）** |
+| **pin 20** | `GND` | **地** |
+
+- CH2 同时挂板载 MMA8653（约 `0x1D`）与 AT24C04（`0x50–0x57`）；PAJ7620 `0x73` 不冲突；
+- 板上 R131/R132 已有 10K 上拉到 3.3V；
+- **CH1 是触摸**（P3 pin 33/34 = `MCU_SCL_1/SDA_1`），不要接；
+- J10 的 `pin 1` 通常有方形焊盘/丝印标记；上电前用万用表复核 pin1-pin20 ≈ 3.3V；
+- CH2 在 Linux 里对应哪条 `/dev/i2c-N` **不能猜**，接上 PAJ 后用 §④ 的 0x73 探测确认。
+
+**✅ 实物丝印（用户照片，2026-11-12）**：这组 J10 是**带针**的 2×10，
+丝印 **1/2 在右端、19/20 在左端**，上排奇数、下排偶数：
+
+| 位置 | 引脚 | 接 PAJ7620 |
+|---|---|---|
+| 上排最右 | **pin 1** | **VIN 3.3V** |
+| 下排最右 | **pin 2** | **5V，绝对不接** |
+| 下排右起第 4 | **pin 8** | **SCL** |
+| 下排右起第 5 | **pin 10** | **SDA** |
+| 下排最左 | **pin 20** | **GND** |
+
+PAJ 模块（GY-PAJ7620U2）丝印为 `VIN / GND / SCL / SDA / INT`：
+VIN→3.3V（模块虽标 3.3–5V，接 3.3V 可保证 I2C 上拉也是 3.3V），INT 悬空。
+4 根母对母杜邦线即可，**不用焊接、不用万用表**。
+
+> ⚠️ 板上还有一组 **LVDS 2×10 排针**，是显示接口（差分对 + 背光电源），
+> **绝不能接传感器**；认准丝印 `GPIO`/`J10` 的那组。接错 LVDS 可能损坏屏幕或主板。
+
+**没有万用表时怎么认 pin1**（按可靠性排序）：
+
+1. **方形焊盘**：2×10 排针的 pin1 焊盘通常是方形，其余是圆形；用手机微距/侧光看；
+2. **丝印 `1` 或 `J10` 旁的标记**：有的板会在 pin1 旁印 `1`、白点、三角或缺口；
+3. **带壳排针的缺口/防呆键**：缺口通常对着 pin1；
+4. **板边倒角/丝印框**：pin1 常在靠近 `J10` 文字或板边倒角的那一端；
+5. **丝印电源标识**：若排针旁印了 `3V3`/`5V`，3.3V 那端就是 pin1（J10 pin1=3.3V、pin2=5V）。
+
+> 如果以上标记一个都没有：**不要猜**。借一个万用表（30 秒），或用 3.3V LED + 1k 电阻
+> 临时点测 3.3V/5V；J10 pin1/2 相邻，错一针可能把 5V 加到 3.3V 传感器上。
+> 拍一张排针的微距照片发群里，也能让有经验的人帮你认方形焊盘。
+
+> **教学板不能焊接时**：若 J10 只有孔、没有排针，不要硬插裸杜邦线。按
+> `sensorSelection.md §6.1` 选：**SOIC-8 测试夹夹 U15（AT24C04，CH2）** / pogo 弹簧探针 /
+> 请实验室代焊 / 第二 MCU + USB 串口 / 板载 MMA8653 降级。P1/P2/P3 是板对板连接器，**不要碰**。
+> U15 引脚：pin8=3.3V、pin4=GND、pin6=SCL_2、pin5=SDA_2；夹之前先量 3.3V、认 pin1 圆点。
+
+> 参考：原理图底板 P11（Sheet 11/12）J10、U14 MMA8653、U15 AT24C04；
+> 核心板 P6（Sheet 6/9）`MCU_SCL_2 = GPIOD6/SCL2`、`MCU_SDA_2 = GPIOD7/SDA2`。
+
+先分清两件事，别混：
+
+- **软件总线号**：Linux 里的 `/dev/i2c-N`，能直接枚举；
+- **物理引脚**：板子上的 `SCL/SDA/3V3/GND`，要看丝印/原理图，或用已知器件闭环确认。
+
+**① 枚举软件总线（板端，不改任何东西）**
+
+```bash
+i2cdetect -l 2>/dev/null || true
+ls -l /sys/bus/i2c/devices/
+for d in /sys/bus/i2c/devices/*; do
+    [ -f "$d/name" ] && echo "$(basename "$d"): $(cat "$d/name")"
+done
+dmesg | grep -i i2c | tail -20
+```
+
+输出里会同时出现**控制器**（`i2c-0`、`i2c-1`…）和**已挂从机**（如 `1-0040`）。
+`1-0040` 这种 `总线号-地址` 就是“总线 1 上的 0x40”，触摸 gslx680 通常就在其中一条上。
+
+**② 识别哪条总线被谁占用**
+
+```bash
+# 看触摸/重力/摄像头等已注册设备
+for d in /sys/bus/i2c/devices/*-*; do
+    [ -f "$d/name" ] && echo "$(basename "$d"): $(cat "$d/name")"
+done
+
+# 内核日志里通常有 gslX680 / mma8653 / camera 的注册行
+dmesg | grep -i -E 'gsl|mma|camera|ov|gc|i2c'
+```
+
+规则：**不要对挂了 gslx680 的总线做全量 `i2cdetect -y N`**。
+优先找一条“只有控制器、没有从机”的总线；没有的话，只对目标地址 `0x73` 做单点探测。
+
+**③ 物理确认（断电操作）**
+
+1. 看底板丝印：找 `SCL`、`SDA`、`3V3`/`3.3V`、`GND`，常见在扩展排针或摄像头 FPC 附近；
+2. 万用表：GND 对 USB 金属壳导通；3.3V 对 GND 约 3.3V；SDA/SCL 空闲时都被上拉到约 3.3V；
+3. **先量电压再接线**：GEC6818 扩展口可能同时有 5V 和 3.3V，接错会烧传感器；
+4. 没有丝印就查课程原理图/接口说明 PDF；再不行拍一张扩展口照片，按“电源脚→地→两脚上拉”反推。
+
+**④ 闭环确认（传感器到货后）**
+
+把 PAJ7620 的 VCC/GND/SDA/SCL 接到候选排针，然后**只探 0x73**：
+
+```bash
+# 有 i2c-tools 时（不要全量扫，指定地址读一个字节）
+i2cget -y <N> 0x73 0x00
+
+# 没有 i2c-tools：用仓库里的 tools/i2c_probe.c
+# VM 编译：
+#   arm-linux-gcc -O2 -o build/i2c_probe tools/i2c_probe.c
+# 板端：
+#   ./i2c_probe /dev/i2c-<N> 0x73
+```
+
+- 返回数据/ACK → 这条 `/dev/i2c-N` 就是它，记下总线号与排针位置；
+- 全部 NAK → 先换 SDA/SCL 再试（I2C 两线都是开漏，交换通常不损坏器件），仍不行再查供电/上拉；
+- **不要**因为“读不到”就全总线盲扫，容易把触摸/camera 探进异常状态。
+
+**⑤ 如果板子没有空闲 I2C 排针**
+
+按优先级：
+
+1. **摄像头 FPC 的 I2C**（DVP/CSI 接口通常带 SCCB/I2C，需确认 FPC 引脚定义）；
+2. **GPIO 模拟 I2C**：先看内核有没有 `i2c-gpio` 模块（`find /lib/modules -name 'i2c-gpio*'`），
+   有就 `insmod i2c-gpio.ko sda=<gpio> scl=<gpio>` 生成 `/dev/i2c-N`；没有则在用户态用 `/dev/mem` 翻转 GPIO（100kHz 可以，但别碰已被占用的脚）；
+3. **换 UART/USB 传感器**或加 USB-I2C 桥（FT232H/CH341），但 M2 两天内不建议。
+
+> 结论：**软件总线号可以马上确认；物理排针要靠丝印/原理图 + 万用表，最后用 0x73 闭环**。
+> 确认结果回填 `sensorSelection.md §9` 与 `config.h` 的 M2 常量（走 `proto/` 报批）。
 
 ### 3.6 UART（串口类传感器）
 

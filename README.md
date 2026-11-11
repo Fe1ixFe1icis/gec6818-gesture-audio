@@ -16,6 +16,7 @@ D1/D2/D3（EOF 后切歌停摆、PAUSE 不上报、ERROR 不上报）已修复�
 | `boardGuide.md` | **开发板参考文档**：硬件规格、启动链、设备节点、LCD/触摸/音频/GPIO/I2C/UART 编程要点、自检清单、故障排查 |
 | `testGuide.md` | **板端测试文档**：现场测试机（连着板子那台）按 T0–T7 分层执行，含用例表、预期输出、故障对照 |
 | `boardSnapshot.md` | **本板实测快照**：ABI（软浮点/glibc 2.23）、fb/ALSA 设备、eth0 PHY 不可用、部署通道结论 |
+| `sensorSelection.md` | **M2 传感器选型记录**：PAJ7620U2 对比/映射/接线/验收/采购，测距后置 |
 | `ubuntuArmBuild.md` | **导入 Ubuntu 做 ARM 交叉编译的实施方案**：打包/传输、工具链与 ALSA 头、`make verify`、NFS 上板、T0–T3 首跑、故障对照 |
 | `devFlow.md` | 开发流程与纪律：分支模型、提交规范、板子占用、NFS 同步、红线 |
 | `gitGuide.md` | **Git 操作指南**：初始化、首次提交、分支、保护规则、日常循环、故障回滚 |
@@ -51,6 +52,7 @@ tools/
   player_regress.py    主机侧 D1/D2/D3 状态机回归（自带 WAV 合成）
   prep_demo_wav.py     大 WAV 裁剪/降混/重采样（串口部署前压缩体积）
   make_serial_upload.ps1  无 rz/rb 时生成 base64 串口上传脚本
+  i2c_probe.c     单地址 I2C 探测（M2 确认 0x73，避免全总线盲扫）
 ```
 
 ## 编译
