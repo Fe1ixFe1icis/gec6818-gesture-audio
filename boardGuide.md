@@ -1,8 +1,15 @@
 # GEC6818 开发板参考文档（Board Guide）
 
 > 适用项目：智能手势控制音频播放器（`projectBrief.md`）
-> 版本：V1.0 · 2026-11-11 · 面向板端开发（C / Linux 系统编程）
+> 版本：**V1.1** · 2026-11-11 · 面向板端开发（C / Linux 系统编程）
 > 定位：**动手前的唯一事实来源**。写代码、接线、上板前先查这里，避免靠"网上抄一段"试错。
+
+**修订记录**
+
+| 版本 | 日期 | 改动 |
+|---|---|---|
+| V1.0 | 2026-11-11 | 初版：硬件 / 系统环境 / 外设编程 / 性能边界 / 自检清单 |
+| V1.1 | 2026-11-11 | ① 调试串口落到本机实测：CH340 USB 转串口、PC 端 **COM6**、SecureCRT 会话 `Serial-COM6`，并补「串口独占」判据与「连上≠通了」排障（§1.2 / §2.2 / §8.B）；② 修 §3.3 延迟预算表把 `period_size` 误标成 `buffer_size` 的错误；③ 修 §4.2 音频环形缓冲容量算错（2 秒 · 立体声 · 16bit = 344KB，原写 700KB）；④ §2.4 标出 `devFlow.md` / `README.md` 里 `-o nlock` 的笔误应为 `nolock`；⑤ §8.D 填入已确认项 |
 
 ## 0. 可信度标记与使用方式
 
@@ -43,7 +50,7 @@
 | 接口 | 规格 | 本项目是否用 |
 |---|---|---|
 | 电源 | DC 5V 圆孔（CN1），**建议 ≥2A 独立适配器** | 是 |
-| 调试串口 | **UART0**，DB9 或 3Pin TTL，**115200 8N1 无流控** ✅ | 是（救命通道） |
+| 调试串口 | **UART0** → **USB 转串口（CH340）** → PC 侧显示为 **COM6**，**115200 8N1 无流控** ✅（本机实测，见 §2.2） | 是（救命通道） |
 | USB OTG | Micro-USB，用于 **fastboot 烧写**，也可作 Host | 烧写时 |
 | USB Host ×3 | 经 HUB 扩展，USB 2.0 | 可选（U 盘/键鼠/WiFi） |
 | 以太网 | RJ45 千兆，RTL8211E | 是（NFS/TCP） |
@@ -136,22 +143,61 @@ bootargs=root=/dev/mmcblk0p2 rw rootfstype=ext4 lcd=vs070cxn tp=gslx680-linux
 
 ### 2.2 串口登录（第一优先级技能）
 
-Windows：SecureCRT / MobaXterm / PuTTY
+Windows：**SecureCRT**（本机在用，会话名 `Serial-COM6`）/ MobaXterm / PuTTY
 
+#### 2.2.1 本机实测参数（2026-11-11 ✅）
+
+| 项 | 实测值 | 怎么查到的 |
+|---|---|---|
+| 转接芯片 | **USB-SERIAL CH340**（`VID_1A86&PID_7523`，驱动服务 `CH341SER_A64`，设备状态 OK，`ConfigManagerErrorCode=0`） | 设备管理器 / `Get-CimInstance Win32_PnPEntity` |
+| PC 端口号 | **COM6** | `[System.IO.Ports.SerialPort]::GetPortNames()` |
+| 终端软件 | **SecureCRT**，会话 `Serial-COM6`，状态栏显示 `Serial, COM6, 115200`，终端类型 VT100，24 行 × 80 列 | 窗口标题与状态栏 |
+| 端口参数 | **115200 · 8 数据位 · 1 停止位 · 无校验 · 无流控** | 同上 |
+| 板端 | UART0 = `/dev/ttySAC0`。底板自带 USB 转串口时一根 USB 线即可；用外置 USB-TTL 模块时接 **GND / TX / RX 三根，TX 与 RX 交叉** | 底板丝印 + 内核 console |
+
+**端口号是机器侧属性，不是板子的属性**：换 USB 口、换电脑、换插拔顺序都会重新分配。别照抄 COM6，先查再连。
+
+SecureCRT 配置位置：`Options → Session Options → Connection → Serial`，Port = `COM6`，Baud rate = `115200`，Data bits = `8`，Parity = `None`，Stop bits = `1`；`Flow Control` 里 **RTS/CTS 与 XON/XOFF 全部取消勾选**（开了就一片乱码，这是最高频的错）。
+
+#### 2.2.2 连之前先确认"是哪一个口"
+
+```powershell
+[System.IO.Ports.SerialPort]::GetPortNames()
+Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match 'COM\d+' } |
+    Select-Object Name, Status, ConfigManagerErrorCode
 ```
-协议 Serial · 端口 COMx（设备管理器看） · 波特率 115200 · 数据位 8 · 校验 None
-停止位 1 · 流控 全部关闭（这点最容易错，开了流控就一片乱码）
+
+要能看见 `USB-SERIAL CH340 (COM6)` 且 `Status=OK`。只看到 `蓝牙链接上的标准串行 (COM3/COM4)` 而没有 CH340，就是线没插好或驱动没装（沁恒官网 `CH341SER` 驱动）。
+
+#### 2.2.3 "连上了"和"通了"是两件事
+
+串口是**独占资源**，同一时刻只有一个程序能打开它。这条特性正好可以当判据，几乎不花钱：
+
+```powershell
+# SecureCRT 已连接时，另开一个 PowerShell 试开同一个口
+$p = New-Object System.IO.Ports.SerialPort("COM6",115200,'None',8,'One')
+$p.Open()   # 报"对端口 COM6 的访问被拒绝" = SecureCRT 确实占着它
 ```
+
+| 现象 | 含义 | 下一步 |
+|---|---|---|
+| 另开程序报 **访问被拒绝** | SecureCRT 持有该口，连接状态正常 | 继续看板端有没有输出 |
+| 另开程序 **打开成功** | 没有程序占用 → SecureCRT 其实没连上 | 在 SecureCRT 里重新 Connect，核对会话端口 |
+| SecureCRT 里按键有本地回显、但**板端零回包**（回车不出新行、不见提示符） | 线路侧没有数据：板子没上电 / 只插了 USB 线没接板子 / TX-RX 接反 / 板端 console 没跑 | 先查供电与 3 根线，再查波特率 |
+
+**本机 2026-11-11 15:5x 实测状态**：适配器在位、端口被 SecureCRT 独占（第一行判据成立）、**但板端无任何回显**（敲回车与字符都只有本地显示）。→ 落在上表第三行，需人工确认板子是否已上电、USB 转串口是否真的接到了 UART0 的 3 根线上。
+
+#### 2.2.4 看到什么算登录成功
+
+看到 `[root@GEC6818 /]#` 即登录成功，root 默认无密码 ⚠️（本机尚未取得回显，未确认）。看不到就按**供电 → 线序 → 波特率 → 流控**的顺序查，不要一上来怀疑板子坏了。
 
 Linux 主机：
 
 ```bash
 sudo minicom -D /dev/ttyUSB0 -b 115200
 # 或
-picocom -b 115200 /dev/ttyUSB0
+picocom -b 115200 /dev/ttyUSB0     # CH340 在 Linux 下是 /dev/ttyUSB0（内核自带 ch341 驱动）
 ```
-
-看到 `[root@GEC6818 /]#` 即登录成功，root 默认无密码。看不到就检查：线序（TX/RX 交叉）、波特率、流控、供电。
 
 ### 2.3 网络配置（每次重启会丢，必须固化）
 
@@ -187,6 +233,8 @@ mount -t nfs -o nolock,vers=3 192.168.1.10:/home/gec6818/nfs /mnt/nfs
 ```
 
 `vers=3` 和 `nolock` 两个参数必须带：3.4 内核对 NFSv4 与锁协议支持不完整，缺了会卡住不返回。
+
+**校注（V1.1）**：`devFlow.md` §4 与 `README.md` 里写成 `mount -t nfs -o nlock ...`，`nlock` 是 `nolock` 的笔误，照抄会挂载失败。挂载命令以本节为准。
 
 **② scp**：镜像若带 sshd 才能用，**先确认 `ps | grep sshd`** ⚠️
 **③ rx（Xmodem）**：板端 `rx file`，SecureCRT 菜单发送；慢，仅应急 ⚠️
@@ -420,13 +468,13 @@ aplay -D hw:0,0 test.wav        # WAV 必须是 16bit/立体声/板子支持的�
 | period_size | 256 ~ 1024 帧 | 256 ≈ 5.8ms，1024 ≈ 23ms @44.1k |
 | buffer_size | 4 × period | 4 个周期，兼顾延迟与抗抖动 |
 
-**延迟预算**（@44.1kHz）：
+**延迟预算**（@44.1kHz；注意表里是 **period_size**，`buffer_size = 4 × period_size`，别把两者混为一谈）：
 
-```
-buffer_size 1024 → 单周期 23ms × 4 ≈ 93ms 端到端缓冲
-buffer_size 512  → ≈ 46ms
-buffer_size 256  → ≈ 23ms   （CPU 抖动大时易 underrun）
-```
+| period_size | buffer_size | 单周期时长 | 端到端缓冲 |
+|---|---|---|---|
+| 1024 | 4096 | 23ms | ≈ 93ms |
+| 512 | 2048 | 12ms | ≈ 46ms |
+| 256 | 1024 | 6ms | ≈ 23ms（CPU 抖动大时易 underrun） |
 
 本项目目标"延迟 ≤ 300ms"，**ALSA 侧留 60~90ms 就够**，剩下的预算给传感器与显示。不要把 buffer 调到 200ms 以上，手感会明显发钝。
 
@@ -649,7 +697,7 @@ int uart_open(const char *dev, int baud)
 | 资源 | 现状 | 结论 |
 |---|---|---|
 | PWM | LCD 背光用 PWM（40Pin 第 1 脚），由内核占用 ⚠️ | 不要抢；需要 PWM 输出得另找引脚并自己配 PWM 寄存器 |
-| 蜂鸣器 | **GPIO 直驱，不是 PWM** ✅ | 只能开关，做不了频率变化，别指望它发声调 |
+| 蜂鸣器 | **GPIO 直驱，不是 PWM** ⚠️（§1.2 同一项也未定；另有资料称是 PWM 引脚复用为 GPIO，待 §8.D 实测） | 只能确认开关，别指望调频发声 |
 | ADC | S5P6818 内置 ADC，但 GEC6818 是否引出通用节点未确认 ❓ | **不要把方案建立在 ADC 上** |
 
 > 对本项目的直接影响：`projectBrief.md` 里"超声波测距（ADC）"这条路径**不可靠**。改用
@@ -686,7 +734,7 @@ free                  # 看可用内存
 df -h                 # 看 eMMC / tmpfs 余量
 ```
 
-- 一帧后备缓冲 1.5MB，音频环形缓冲按 2 秒算 44.1k×2ch×2B×2s ≈ 700KB，都很小
+- 一帧后备缓冲 1.5MB；音频环形缓冲按 2 秒算 44,100 × 2ch × 2B × 2s ≈ **345KB**（V1.0 写的 700KB 是按 4 秒算的量，已更正），都很小
 - 大音频素材放 `/mnt/nfs` 或 `/userdata`，**别塞根分区**（写满根分区会启动失败）
 - 内存不是约束，**别为省内存牺牲代码可读性**
 
@@ -745,6 +793,7 @@ static double now_ms(void)
 
 | # | 命令 | 期望结果 | 不通过怎么办 |
 |---|---|---|---|
+| 0 | SecureCRT 连 COM6，敲回车 | 出现 `[root@GEC6818 /]#` | 按 §2.2.3 三段判据查：独占 → 供电 → 线序 → 波特率/流控 |
 | 1 | `uname -a` | 含 `3.4.39`，armv7l | 镜像不对，重烧 |
 | 2 | `cat /proc/cpuinfo \| grep -c processor` | `8` | 内核配置异常 |
 | 3 | `free` | 总内存 ~1GB | 内存参数错误 |
@@ -771,6 +820,8 @@ static double now_ms(void)
 |---|---|---|---|
 | 串口全是乱码 | 波特率/流控 | 换 115200 8N1，关流控 | 重设终端 |
 | 上电无任何输出 | 供电不足 / 串口线序 | 换 5V/2A 电源，TX-RX 交叉 | 换线换电源 |
+| 终端全空白，回车无反应 | SecureCRT 没真正 Connect / 板子没上电 / TX-RX 没接 | 另开 PowerShell 试开 COM6，看是否「拒绝访问」 | 重新 Connect，查供电与线序（§2.2.3） |
+| `对端口 COM6 的访问被拒绝` | 串口被另一个终端占着（多开的 SecureCRT / 串口助手） | `Get-Process SecureCRT`、关掉多余会话 | 同一时刻只留一个连接者 |
 | 屏幕白屏/花屏 | bootargs 屏参错 / 排线松 | `cat /proc/cmdline`，`fbset` | 改 `lcd=`，重插排线 |
 | 程序跑不起来 `No such file` | 架构/ABI/解释器不符 | `file`、`readelf -A`、`ldd` | 换 gnueabihf 工具链，或 `-static` |
 | `GLIBC_2.xx not found` | 编译器版本过高 | `readelf --version-info` | 降到 4.9.4 重编 |
@@ -834,7 +885,7 @@ ps; top -n 1; killall <名字>
 | 根分区 | `/dev/mmcblk0p2`（ext4） |
 | 屏参 bootargs | `lcd=vs070cxn tp=gslx680-linux` |
 | 帧缓冲大小 | 800×480×4 = 1,536,000 B |
-| 调试串口 | UART0 / 115200 8N1 / 无流控 |
+| 调试串口 | UART0（板端 `/dev/ttySAC0`）/ 115200 8N1 / 无流控 / PC 侧 **COM6（CH340，2026-11-11 实测）** |
 
 ### 8.C 参考资料
 
@@ -852,6 +903,8 @@ ps; top -n 1; killall <名字>
 
 | 项 | 待确认内容 | 实测命令 | 结论 | 确认人/日期 |
 |---|---|---|---|---|
+| 串口端口与适配器 | PC 侧口号、转接芯片型号、驱动是否正常 | `[System.IO.Ports.SerialPort]::GetPortNames()`；`Get-CimInstance Win32_PnPEntity` | **COM6 / USB-SERIAL CH340（VID_1A86&PID_7523，驱动 CH341SER_A64，Status=OK）** ✅ | 成员机 2026-11-11 |
+| 串口能否登录 | 115200 8N1 无流控下是否出现 `[root@GEC6818 /]#` | SecureCRT 敲回车 | 端口被 SecureCRT 独占（判据成立）；**板端当前零回包，待确认上电与线序** ⚠️ | 成员机 2026-11-11 |
 | 工具链 ABI | 板上是硬浮点还是软浮点 | `readelf -A /bin/busybox` | | |
 | 触摸 event 号 | gslx680 对应 `/dev/input/event?` | `cat /proc/bus/input/devices` | | |
 | 触摸坐标范围 | ABS_X/ABS_Y 的 maximum，是否需反向 | `evtest` | | |
@@ -869,7 +922,7 @@ ps; top -n 1; killall <名字>
 
 ## 9. 一页速记（贴在调试位墙上）
 
-1. 串口 **115200 8N1 无流控**，先接串口再上电。
+1. 串口 **115200 8N1 无流控**，PC 侧当前是 **COM6 / CH340 / SecureCRT 会话 `Serial-COM6`**；先接串口再上电，而且先查口号、别照抄。
 2. 屏 **800×480×32bpp**，`0x00RRGGBB`，双缓冲再提交。
 3. 触摸**按名字找 event**，坐标**必须缩放**。
 4. 声卡 `card 0`，**单一 owner**，`buffer 2048 / period 512` 起步。
