@@ -4,8 +4,8 @@
  * 关键设计决定（都写在这里，避免后来者重复讨论）：
  *   1. v1 只吃 WAV（PCM 16bit）。MP3 会让解码进关键路径，且在板子上
  *      还需要额外库（boardGuide.md §3.3）。素材要求由测试文档写死。
- *   2. 变速用「线性插值改重采样步长」，音调随动。变速不变调要 WSOLA，
- *      留给 M5 评估，不做进 v1 的必经路径。
+ *   2. 变速用「窗口 sinc 抗混叠重采样改步长」（src/resample.c），音调随动。
+ *      变速不变调要 WSOLA，留给 M5 评估，不做进 v1 的必经路径。
  *   3. sink 抽象成两种实现，音频写入是唯一与硬件相关的代码，
  *      BOARD=0 时空 sink 按墙上时钟推进，保证状态机/时序在主机上可验证。
  *   4. 单写者：参数只从 ctrl（params_get）读，绝不回写；状态机请求由
@@ -22,6 +22,7 @@
 #include "ctrl.h"
 #include "common.h"
 #include "app.h"
+#include "resample.h"
 
 #if defined(BOARD) && BOARD
 #include <alsa/asoundlib.h>
@@ -54,8 +55,10 @@ static int     s_wav_open;
 
 static int16_t s_srcbuf[SRC_BUF_FRAMES * AUDIO_CHANNELS];
 static int     s_src_len;          /* 缓冲内有效帧数 */
-static double  s_src_pos;          /* 浮点读位置（帧） */
 static int     s_src_eof;
+
+static resampler_t s_rs;           /* 抗混叠变速重采样器（M5Q-01） */
+static double      s_last_step;    /* 缓存的 step，变化时才重建系数表 */
 
 static int16_t s_out[AUDIO_PERIOD_FRAMES * AUDIO_CHANNELS];
 static int16_t s_scope[SCOPE_POINTS];
@@ -280,17 +283,8 @@ static void null_sink_pace(int frames)
 /* ================= 源读取与重采样 ================= */
 static int src_refill(void)
 {
-    int consumed = (int)s_src_pos;
-    int remain = s_src_len - consumed;
     int want, got;
 
-    if (consumed > 0) {
-        if (remain > 0)
-            memmove(s_srcbuf, s_srcbuf + (size_t)consumed * s_wav.channels,
-                    (size_t)remain * s_wav.channels * sizeof(int16_t));
-        s_src_len = remain;
-        s_src_pos -= consumed;
-    }
     if (s_src_eof) return 0;
 
     want = SRC_BUF_FRAMES - s_src_len;
@@ -314,37 +308,45 @@ static int src_refill(void)
     return got;
 }
 
+/* 丢弃已消费的源帧，剩余 memmove 到缓冲头（resampler 内部已前移 pos） */
+static void consume_src(int consumed)
+{
+    int remain;
+    if (consumed <= 0) return;
+    remain = s_src_len - consumed;
+    if (remain > 0)
+        memmove(s_srcbuf, s_srcbuf + (size_t)consumed * s_channels,
+                (size_t)remain * s_channels * sizeof(int16_t));
+    s_src_len = remain;
+}
+
 /*
- * 线性插值重采样。step = 源采样率 × 速度 / 输出采样率，
+ * 窗口 sinc 抗混叠重采样（src/resample.c）。step = 源采样率 × 速度 / 输出采样率，
  * 一步完成「变速」与「采样率转换」两件事。
  * 返回实际产出的帧数（< frames 表示源已结束）。
  */
 static int resample(int frames, double step)
 {
-    int produced = 0;
+    int produced, consumed;
 
-    while (produced < frames) {
-        int i0, i1;
-        double frac;
-        int ch;
+    if (step != s_last_step) {
+        resampler_set_step(&s_rs, step);
+        s_last_step = step;
+    }
 
-        while ((int)s_src_pos >= s_src_len - 1) {
-            if (src_refill() <= 0 && (int)s_src_pos >= s_src_len - 1)
-                return produced;                  /* 源耗尽 */
-        }
-        i0 = (int)s_src_pos;
-        i1 = i0 + 1;
-        if (i1 >= s_src_len) i1 = i0;
-        frac = s_src_pos - i0;
+    produced = resampler_process(&s_rs, s_srcbuf, s_src_len,
+                                 s_out, frames, &consumed);
+    consume_src(consumed);
 
-        for (ch = 0; ch < s_channels; ch++) {
-            int a = s_srcbuf[i0 * s_wav.channels + ch];
-            int b = s_srcbuf[i1 * s_wav.channels + ch];
-            double v = a + (b - a) * frac;
-            s_out[produced * s_channels + ch] = (int16_t)v;
-        }
-        s_src_pos += step;
-        produced++;
+    while (produced < frames && !s_src_eof) {
+        int more, c2;
+        if (src_refill() <= 0)
+            break;
+        more = resampler_process(&s_rs, s_srcbuf, s_src_len,
+                                 s_out + (size_t)produced * s_channels,
+                                 frames - produced, &c2);
+        consume_src(c2);
+        produced += more;
     }
     return produced;
 }
@@ -414,7 +416,7 @@ static int track_open(int index)
     }
     /* 源采样率与输出不同没关系，重采样的 step 会一并处理 */
     s_src_len = s_src_eof = 0;
-    s_src_pos = 0.0;
+    s_rs.pos = 0.0;
     s_track_index = index;
     s_wav_open = 1;
     s_base_ms = now_ms();
@@ -433,13 +435,15 @@ static void track_close(void)
     s_wav.fp = NULL;
     s_wav_open = 0;
     s_src_len = s_src_eof = 0;
-    s_src_pos = 0.0;
+    s_rs.pos = 0.0;
 }
 
 /* ================= 对外接口 ================= */
 int player_init(void)
 {
     s_state = PLAY_STOPPED;
+    resampler_init(&s_rs, s_channels, 1.0);
+    s_last_step = 0.0;
     if (effect_init(s_rate, s_channels) != 0) return -1;
     LOGD(TAG, "初始化完成：输出 %d Hz / %d ch / period %d 帧",
          s_rate, s_channels, AUDIO_PERIOD_FRAMES);

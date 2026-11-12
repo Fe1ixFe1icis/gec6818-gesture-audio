@@ -18,6 +18,7 @@
 #include "config.h"
 
 #define TAG "effect"
+#define EQ_RAMP_MS 30      /* M5Q-02：EQ 增益切换斜坡时长（20–50ms 取 30ms） */
 
 /* ---------------- biquad ---------------- */
 typedef struct {
@@ -26,7 +27,10 @@ typedef struct {
 } biquad_t;
 
 static biquad_t s_eq[3][AUDIO_CHANNELS];   /* 0 低 / 1 中 / 2 高 */
-static float    s_eq_gain[3];              /* 上次生效的增益，用于判断是否重算 */
+static float    s_eq_gain[3];              /* 目标增益 dB（M5Q-02：斜坡终点） */
+static float    s_eq_cur_gain[3];          /* 当前实际生效增益 dB（斜坡起点） */
+static float    s_eq_step[3];              /* 每采样增益斜坡 dB（0 = 已到位） */
+static int      s_eq_primed;               /* 是否已收到首次 set_cfg */
 
 /* ---------------- 回声 ---------------- */
 static int16_t *s_echo_buf;                /* 交织立体声延迟线 */
@@ -43,6 +47,27 @@ static int         s_inited;
 static int clamp_i(int v, int lo, int hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* M5Q-04 软限幅：|x| <= 拐点（0.9FS）时线性直通，之上用软拐点渐近饱和。
+ * 输出严格落在 (-32768, 32767) 内，保证 int16 截断不会产生 ±32767/-32768
+ * 的硬削波样本。线性区保证小信号零失真（THD、频响不受影响）。 */
+static inline float soft_limit(float x)
+{
+    const float fs   = 32767.0f;
+    const float knee = 0.90f * fs;    /* ≈ -0.9dBFS */
+    const float w    = 0.10f * fs;    /* 拐点宽度 */
+    float ax = x < 0.0f ? -x : x;
+
+    if (ax <= knee)
+        return x;                     /* 线性区 */
+
+    {
+        float t = (ax - knee) / w;
+        float g = t / (1.0f + t);     /* 0..1，渐近但永不等于 1 */
+        float y = knee + g * (fs - knee);
+        return x < 0.0f ? -y : y;
+    }
 }
 
 /* ---------------- biquad 系数（RBJ Audio EQ Cookbook） ---------------- */
@@ -106,7 +131,7 @@ static void eq_peaking(biquad_t *f, float rate, float f0, float q, float gain_db
 static void eq_recalc(int band)
 {
     int ch;
-    float gain = s_eq_gain[band];
+    float gain = s_eq_cur_gain[band];
     biquad_t f;
 
     memset(&f, 0, sizeof f);
@@ -115,11 +140,14 @@ static void eq_recalc(int band)
     else                eq_high_shelf(&f, (float)s_rate, 4000.0f, gain);
 
     for (ch = 0; ch < s_channels && ch < AUDIO_CHANNELS; ch++) {
-        s_eq[band][ch] = f;          /* 保留系数，清状态防爆音 */
-        s_eq[band][ch].z1 = 0.0f;
-        s_eq[band][ch].z2 = 0.0f;
+        /* M5Q-02：切系数**保留** z1/z2（不清状态）。清状态会把滤波器内部
+         * 能量一次性倾倒出来，正是"咔哒/爆音"的来源。 */
+        float z1 = s_eq[band][ch].z1;
+        float z2 = s_eq[band][ch].z2;
+        s_eq[band][ch] = f;
+        s_eq[band][ch].z1 = z1;
+        s_eq[band][ch].z2 = z2;
     }
-    LOGD(TAG, "EQ band%d 重算，增益 %+.1f dB", band, gain);
 }
 
 static inline float bq_process(biquad_t *f, float x)
@@ -156,7 +184,7 @@ static int echo_alloc(int delay_ms)
 /* ---------------- 对外接口 ---------------- */
 int effect_init(int rate, int channels)
 {
-    int band;
+    int band, ch;
 
     if (rate <= 0 || channels <= 0 || channels > AUDIO_CHANNELS) {
         LOGE(TAG, "非法参数 rate=%d channels=%d", rate, channels);
@@ -171,8 +199,17 @@ int effect_init(int rate, int channels)
     s_cfg.echo_fb       = DEF_ECHO_FB;
 
     for (band = 0; band < 3; band++) {
-        s_eq_gain[band] = 100.0f;     /* 逼迫首次 set_cfg 重算 */
+        s_eq_gain[band]     = 0.0f;
+        s_eq_cur_gain[band] = 0.0f;
+        s_eq_step[band]     = 0.0f;
     }
+    s_eq_primed = 0;
+    /* 初始化为单位增益（b0=1），保证首次 set_cfg 前的任何处理都等同旁通 */
+    for (band = 0; band < 3; band++)
+        for (ch = 0; ch < AUDIO_CHANNELS; ch++) {
+            memset(&s_eq[band][ch], 0, sizeof s_eq[band][ch]);
+            s_eq[band][ch].b0 = 1.0f;
+        }
     effect_reset();
     return echo_alloc(s_cfg.echo_delay_ms);
 }
@@ -201,11 +238,21 @@ void effect_reset(void)
     if (s_echo_buf && s_echo_len)
         memset(s_echo_buf, 0, (size_t)s_echo_len * s_channels * sizeof(int16_t));
     s_echo_pos = 0;
+
+    /* M5Q-02：切歌/复位后没有信号连续性，增益无需斜坡，直接落到目标并重算
+     * 系数（z1/z2 刚已清零，重算后保持零态）。 */
+    for (band = 0; band < 3; band++) {
+        if (s_eq_step[band] != 0.0f || s_eq_cur_gain[band] != s_eq_gain[band]) {
+            s_eq_cur_gain[band] = s_eq_gain[band];
+            s_eq_step[band]     = 0.0f;
+            eq_recalc(band);
+        }
+    }
 }
 
 void effect_set_cfg(const effect_cfg_t *cfg)
 {
-    int want_delay;
+    int want_delay, band;
 
     if (!cfg || !s_inited) return;
     s_cfg.echo_on = cfg->echo_on ? 1 : 0;
@@ -221,9 +268,34 @@ void effect_set_cfg(const effect_cfg_t *cfg)
     }
     s_cfg.echo_delay_ms = s_echo_delay_ms;
 
-    if (s_eq_gain[0] != (float)s_cfg.eq_low)  { s_eq_gain[0] = (float)s_cfg.eq_low;  eq_recalc(0); }
-    if (s_eq_gain[1] != (float)s_cfg.eq_mid)  { s_eq_gain[1] = (float)s_cfg.eq_mid;  eq_recalc(1); }
-    if (s_eq_gain[2] != (float)s_cfg.eq_high) { s_eq_gain[2] = (float)s_cfg.eq_high; eq_recalc(2); }
+    for (band = 0; band < 3; band++) {
+        float target = (band == 0) ? (float)s_cfg.eq_low :
+                       (band == 1) ? (float)s_cfg.eq_mid :
+                                     (float)s_cfg.eq_high;
+
+        if (!s_eq_primed) {
+            /* 首次：无历史信号，直接到位 */
+            s_eq_gain[band]     = target;
+            s_eq_cur_gain[band] = target;
+            s_eq_step[band]     = 0.0f;
+            eq_recalc(band);
+            continue;
+        }
+        if (s_eq_gain[band] == target)
+            continue;                 /* 目标未变：斜坡继续或已停，不动 */
+
+        s_eq_gain[band] = target;
+        {
+            float ramp = (float)s_rate * (EQ_RAMP_MS / 1000.0f);
+            s_eq_step[band] = (target - s_eq_cur_gain[band]) / ramp;
+            if (s_eq_step[band] == 0.0f)
+                eq_recalc(band);      /* 目标恰等于当前（几乎不会）：直接到位 */
+        }
+        LOGD(TAG, "EQ band%d 目标 %+.1f dB（%d ms 斜坡）",
+             band, target, EQ_RAMP_MS);
+    }
+    if (!s_eq_primed)
+        s_eq_primed = 1;
 }
 
 int effect_active(void)
@@ -236,13 +308,30 @@ int effect_active(void)
 
 void effect_process(int16_t *buf, int frames)
 {
-    int i, ch;
+    int i, ch, band;
     int eq_on = (s_cfg.eq_low || s_cfg.eq_mid || s_cfg.eq_high) ? 1 : 0;
     float fb  = (float)s_cfg.echo_fb / 100.0f;
     const float wet = 0.7f;
 
     if (!s_inited || !buf || frames <= 0) return;
-    if (!s_cfg.echo_on && !eq_on) return;      /* bypass 快路径 */
+
+    /* EQ 关闭：把仍在斜坡的增益直接落到目标并重算系数（旁通期间无需斜坡），
+     * 同时清滤波器状态，避免下次开启时系数/状态与目标不一致产生瞬态。 */
+    if (!eq_on) {
+        for (band = 0; band < 3; band++)
+            for (ch = 0; ch < AUDIO_CHANNELS; ch++) {
+                s_eq[band][ch].z1 = 0.0f;
+                s_eq[band][ch].z2 = 0.0f;
+            }
+        for (band = 0; band < 3; band++) {
+            if (s_eq_cur_gain[band] != s_eq_gain[band] || s_eq_step[band] != 0.0f) {
+                s_eq_cur_gain[band] = s_eq_gain[band];
+                s_eq_step[band]     = 0.0f;
+                eq_recalc(band);   /* z1/z2 已清，重算后保持零态 */
+            }
+        }
+        if (!s_cfg.echo_on) return;           /* 全关：旁通快路径 */
+    }
 
     /* 1) 回声 */
     if (s_cfg.echo_on && s_echo_buf && s_echo_len > 0) {
@@ -254,9 +343,7 @@ void effect_process(int16_t *buf, int frames)
                 float dly = (float)s_echo_buf[idx];
                 float out = dry + wet * dly;
 
-                if (out > 32767.0f)  out = 32767.0f;
-                if (out < -32768.0f) out = -32768.0f;
-                buf[base + ch] = (int16_t)out;
+                buf[base + ch] = (int16_t)soft_limit(out);
 
                 /* 反馈路径带回饱和保护，禁止 fb 调到 100% 自激 */
                 {
@@ -274,14 +361,28 @@ void effect_process(int16_t *buf, int frames)
     if (eq_on) {
         for (i = 0; i < frames; i++) {
             int base = i * s_channels;
+            /* M5Q-02：增益斜坡，每采样推进；到位即重算系数（保留 z1/z2） */
+            for (band = 0; band < 3; band++) {
+                if (s_eq_step[band] == 0.0f) continue;
+                {
+                    float next = s_eq_cur_gain[band] + s_eq_step[band];
+                    float tgt  = s_eq_gain[band];
+                    if ((s_eq_step[band] > 0.0f && next >= tgt) ||
+                        (s_eq_step[band] < 0.0f && next <= tgt)) {
+                        s_eq_cur_gain[band] = tgt;
+                        s_eq_step[band]     = 0.0f;
+                    } else {
+                        s_eq_cur_gain[band] = next;
+                    }
+                }
+                eq_recalc(band);
+            }
             for (ch = 0; ch < s_channels; ch++) {
                 float x = (float)buf[base + ch];
                 x = bq_process(&s_eq[0][ch], x);
                 x = bq_process(&s_eq[1][ch], x);
                 x = bq_process(&s_eq[2][ch], x);
-                if (x > 32767.0f)  x = 32767.0f;
-                if (x < -32768.0f) x = -32768.0f;
-                buf[base + ch] = (int16_t)x;
+                buf[base + ch] = (int16_t)soft_limit(x);
             }
         }
     }

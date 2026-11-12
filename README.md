@@ -51,6 +51,7 @@ tools/
   pack_for_ubuntu.ps1  Windows 侧打包成可导入 Ubuntu 的源码 tar.gz
   player_regress.py    主机侧 D1/D2/D3 状态机回归（自带 WAV 合成）
   prep_demo_wav.py     大 WAV 裁剪/降混/重采样（串口部署前压缩体积）
+  audio_quality.c      离线音质测试工具（M5Q-07：THD+N/混叠/削波/回声，主机一键报告）
   make_serial_upload.ps1  无 rz/rb 时生成 base64 串口上传脚本
   i2c_probe.c     单地址 I2C 探测（M2 确认 0x73，避免全总线盲扫）
 ```

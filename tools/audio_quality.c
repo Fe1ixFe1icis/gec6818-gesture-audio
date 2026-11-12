@@ -1,0 +1,623 @@
+/*
+ * audio_quality.c —— 离线音质测试工具（M5Q-07）
+ *
+ * 目标：不依赖板子，一键量化「播放链路」的客观音质指标，作为 M5Q-01/02/04
+ *       改代码前 / 改代码后的"尺子"。同一份报告，改前改后可逐项对比。
+ *
+ * 覆盖（对应 taskBoard.md §3.4）：
+ *   - 重采样器（链接真实 src/resample.c 的抗混叠窗口 sinc，M5Q-01 共用）：
+ *     频响、混叠分量、抗混叠抑制
+ *   - 效果链（链接真实 src/effect.c）：THD+N、削波、回声衰减
+ *   - 信号：正弦（单频/扫频）、脉冲、粉噪
+ *
+ * 重采样器直接链接 src/resample.c：与板端 player.c 共用同一实现，保证
+ * "改前/改后可比"——本工具测的就是板端真正跑的那份抗混叠重采样。
+ *
+ * 编译（开发机，MinGW 或 Linux 主机）：
+ *   gcc -std=gnu99 -O2 -Wall -Wextra -Wno-unused-parameter \
+ *       -Iinclude -Isrc -DBOARD=0 -D_GNU_SOURCE -pthread \
+ *       tools/audio_quality.c src/effect.c src/resample.c src/log.c \
+ *       -o build/audio_quality -lm
+ *   或：make audio_quality
+ *
+ * 运行：
+ *   ./build/audio_quality [--outdir build/aq_report]
+ *   退出码 = 失败项数量（0 = 全部通过）。
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+#include "effect.h"     /* 真实效果链（链接 src/effect.c） */
+#include "resample.h"   /* 真实抗混叠重采样（链接 src/resample.c，M5Q-01 共用） */
+#include "config.h"     /* AUDIO_RATE_HZ 等 */
+#include "common.h"     /* log 宏（链接 src/log.c，本工具设成 ERROR 静默） */
+
+#ifdef _WIN32
+#include <direct.h>
+#define MKDIR_P(p) _mkdir(p)
+#else
+#include <sys/stat.h>
+#define MKDIR_P(p) mkdir(p, 0755)
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define RATE        44100      /* 播放器输出采样率 */
+#define CH          2          /* 立体声 */
+#define RATE_SRC    48000      /* demo 素材采样率，用于 2.0x 混叠用例 */
+#define FFT_N       32768      /* FFT 点数（2 的幂） */
+
+/* ---------------- 验收阈值（与 taskBoard §3.4 对齐） ---------------- */
+#define LIM_ALIAS_DBC      -40.0   /* 混叠/杂散分量上限 dBc（M5Q-01） */
+#define LIM_SUPPRESS_DBFS  -40.0   /* 上奈奎斯特分量抑制 dBFS（M5Q-01） */
+#define LIM_ROLLOFF_20K    -6.0    /* 20k 频响衰减上限 dB（M5Q-01，粗糙度） */
+#define LIM_THD_PCT        1.0     /* THD+N 上限 %（M5Q-04） */
+#define LIM_CLIP_SAMPLES   0       /* 硬削波样本数上限（M5Q-04） */
+#define LIM_ECHO_MIN       3       /* 最少可闻回声次数（M5Q-03） */
+#define LIM_CLICK_DBFS     -60.0   /* EQ 切换 click 峰值上限 dBFS（M5Q-02） */
+
+static int g_fails = 0;
+
+static void report(const char *name, int pass, const char *metric,
+                   const char *limit, const char *detail)
+{
+    printf("  [%s] %-22s %-26s (limit %s)  %s\n",
+           pass ? "PASS" : "FAIL", name, metric, limit, detail);
+    if (!pass) g_fails++;
+}
+
+static int16_t to_i16(double v)
+{
+    if (v > 32767.0) v = 32767.0;
+    if (v < -32768.0) v = -32768.0;
+    return (int16_t)(v >= 0.0 ? v + 0.5 : v - 0.5);
+}
+
+/* ================= WAV 写盘（16bit PCM，仅报告/检查用） ================= */
+typedef struct {
+    FILE *fp;
+    uint32_t data_bytes;
+} wavw_t;
+
+static void put16(FILE *f, uint16_t v)
+{
+    fputc((int)(v & 0xFF), f);
+    fputc((int)((v >> 8) & 0xFF), f);
+}
+static void put32(FILE *f, uint32_t v)
+{
+    fputc((int)(v & 0xFF), f);
+    fputc((int)((v >> 8) & 0xFF), f);
+    fputc((int)((v >> 16) & 0xFF), f);
+    fputc((int)((v >> 24) & 0xFF), f);
+}
+
+static int wav_open(wavw_t *w, const char *path, int rate, int ch)
+{
+    w->fp = fopen(path, "wb");
+    if (!w->fp) return -1;
+    fwrite("RIFF", 1, 4, w->fp); put32(w->fp, 0);
+    fwrite("WAVE", 1, 4, w->fp);
+    fwrite("fmt ", 1, 4, w->fp); put32(w->fp, 16);
+    put16(w->fp, 1); put16(w->fp, (uint16_t)ch);
+    put32(w->fp, (uint32_t)rate);
+    put32(w->fp, (uint32_t)(rate * ch * 2));
+    put16(w->fp, (uint16_t)(ch * 2)); put16(w->fp, 16);
+    fwrite("data", 1, 4, w->fp); put32(w->fp, 0);
+    w->data_bytes = 0;
+    return 0;
+}
+static void wav_write(wavw_t *w, const int16_t *buf, long frames, int ch)
+{
+    size_t bytes = (size_t)frames * (size_t)ch * 2;
+    fwrite(buf, 1, bytes, w->fp);
+    w->data_bytes += (uint32_t)bytes;
+}
+static void wav_close(wavw_t *w)
+{
+    uint32_t riff = 36u + w->data_bytes;
+    fseek(w->fp, 4, SEEK_SET); put32(w->fp, riff);
+    fseek(w->fp, 40, SEEK_SET); put32(w->fp, w->data_bytes);
+    fclose(w->fp);
+}
+
+/* ================= 信号生成（输出立体声 int16） ================= */
+static void gen_sine(int16_t *buf, long frames, double freq, double rate,
+                     double amp)
+{
+    long i;
+    for (i = 0; i < frames; i++) {
+        int16_t s = to_i16(amp * sin(2.0 * M_PI * freq * (double)i / rate));
+        buf[i * 2] = s;
+        buf[i * 2 + 1] = s;
+    }
+}
+
+static void gen_impulse(int16_t *buf, long frames, double amp)
+{
+    memset(buf, 0, (size_t)frames * CH * sizeof(int16_t));
+    buf[0] = buf[1] = to_i16(amp);
+}
+
+static void gen_chirp(int16_t *buf, long frames, double f0, double f1,
+                      double rate, double amp)
+{
+    long i;
+    double phase = 0.0;
+    double k = (f1 - f0) / (double)frames;   /* 每帧频率增量（线性扫频） */
+    for (i = 0; i < frames; i++) {
+        double f = f0 + k * (double)i;
+        phase += 2.0 * M_PI * f / rate;
+        int16_t s = to_i16(amp * sin(phase));
+        buf[i * 2] = s;
+        buf[i * 2 + 1] = s;
+    }
+}
+
+/* ================= 重采样器 =================
+ * 直接链接 src/resample.c 的 resampler_block()，与板端 player.c 共用同一实现，
+ * 保证本工具测的就是真正跑的那份抗混叠重采样（M5Q-01）。 */
+
+/* ================= 频谱工具 ================= */
+static double goertzel_mag(const double *x, long n, double freq, double rate)
+{
+    double w = 2.0 * M_PI * freq / rate;
+    double cw = 2.0 * cos(w);
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0;
+    long i;
+
+    for (i = 0; i < n; i++) {
+        s0 = x[i] + cw * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    {
+        double re = s1 - s2 * cos(w);
+        double im = s2 * sin(w);
+        return sqrt(re * re + im * im);
+    }
+}
+
+/* 就地 radix-2 FFT（re/im 各 n 点，n 为 2 的幂） */
+static void fft_radix2(double *re, double *im, int n, int inv)
+{
+    int i, j, len;
+
+    for (i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            double t = re[i]; re[i] = re[j]; re[j] = t;
+            t = im[i]; im[i] = im[j]; im[j] = t;
+        }
+    }
+    for (len = 2; len <= n; len <<= 1) {
+        double ang = 2.0 * M_PI / (double)len * (inv ? -1.0 : 1.0);
+        double wr = cos(ang), wi = sin(ang);
+        for (i = 0; i < n; i += len) {
+            double cr = 1.0, ci = 0.0;
+            int half = len / 2;
+            for (j = 0; j < half; j++) {
+                int a = i + j, b = i + j + half;
+                double vr = re[b] * cr - im[b] * ci;
+                double vi = re[b] * ci + im[b] * cr;
+                re[b] = re[a] - vr; im[b] = im[a] - vi;
+                re[a] = re[a] + vr; im[a] = im[a] + vi;
+                {
+                    double ncr = cr * wr - ci * wi;
+                    ci = cr * wi + ci * wr;
+                    cr = ncr;
+                }
+            }
+        }
+    }
+    if (inv) for (i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+}
+
+/* 左声道抽成 double + Hann 窗，返回实际样本数（n <= cap） */
+static long window_left(const int16_t *buf, long frames, double *out, int cap)
+{
+    long i, n = frames < cap ? frames : cap;
+    for (i = 0; i < n; i++) {
+        double w = 0.5 * (1.0 - cos(2.0 * M_PI * (double)i / (double)(n - 1)));
+        out[i] = w * ((double)buf[i * CH] / 32768.0);
+    }
+    return n;
+}
+
+/* 找峰值 bin（忽略 DC），返回 bin 下标 */
+static int peak_bin(const double *re, const double *im, int n)
+{
+    int half = n / 2, i, best = 1;
+    double best_v = 0.0;
+    for (i = 1; i < half; i++) {
+        double m = re[i] * re[i] + im[i] * im[i];
+        if (m > best_v) { best_v = m; best = i; }
+    }
+    return best;
+}
+
+/* 判断 bin 是否在「基频 × m」附近（±2 bin），用于排除基频与谐波 */
+static int near_harmonic(int bin, int fund, int m)
+{
+    int target = fund * m;
+    return bin >= target - 2 && bin <= target + 2;
+}
+
+/* 最强杂散分量（dBc）：除基频与 2..10 次谐波外的最强 bin */
+static double spurious_dbc(const double *re, const double *im, int n, int fund)
+{
+    int half = n / 2, i, m;
+    double fund_p = re[fund] * re[fund] + im[fund] * im[fund];
+    double spur = 0.0;
+
+    if (fund_p <= 0.0) return 0.0;
+    for (i = 1; i < half; i++) {
+        int skip = 0;
+        for (m = 1; m <= 10; m++)
+            if (near_harmonic(i, fund, m)) { skip = 1; break; }
+        if (skip) continue;
+        {
+            double p = re[i] * re[i] + im[i] * im[i];
+            if (p > spur) spur = p;
+        }
+    }
+    return 10.0 * log10(spur / fund_p);
+}
+
+/* THD+N（%）：基频功率附近 ±2 bin，全带噪声（含谐波与泄漏） */
+static double thd_plus_n_pct(const double *re, const double *im, int n, int fund)
+{
+    int half = n / 2, i;
+    double fund_p = 0.0, total_p = 0.0;
+
+    for (i = 1; i < half; i++) {
+        double p = re[i] * re[i] + im[i] * im[i];
+        total_p += p;
+        if (near_harmonic(i, fund, 1)) fund_p += p;
+    }
+
+    if (fund_p <= 0.0) return 0.0;
+    return sqrt((total_p - fund_p) / fund_p) * 100.0;
+}
+
+/* ================= 效果链辅助 ================= */
+static void effect_eq(int low, int mid, int high)
+{
+    effect_cfg_t c;
+    memset(&c, 0, sizeof c);
+    c.echo_delay_ms = DEF_ECHO_DELAY_MS;
+    c.eq_low = low; c.eq_mid = mid; c.eq_high = high;
+    effect_set_cfg(&c);
+}
+
+static void effect_echo(int delay_ms, int fb)
+{
+    effect_cfg_t c;
+    memset(&c, 0, sizeof c);
+    c.echo_on = 1;
+    c.echo_delay_ms = delay_ms;
+    c.echo_fb = fb;
+    effect_set_cfg(&c);
+}
+
+/* ================= 测试用例 ================= */
+
+/* 频响：48k 源 @1.0x → 44.1k，测各频率通过量（量化"发糊/发刺"滚降） */
+static void test_freq_response(const char *outdir)
+{
+    static const double freqs[] = { 1000, 2000, 4000, 6000, 8000,
+                                    10000, 12000, 15000, 18000, 20000 };
+    long src_frames = RATE_SRC;                 /* 1 秒源 */
+    double step = (double)RATE_SRC / (double)RATE;   /* ≈1.088 */
+    int16_t *src = malloc((size_t)src_frames * CH * sizeof(int16_t));
+    int16_t *dst = malloc((size_t)(src_frames + 8) * CH * sizeof(int16_t));
+    double *x = malloc((size_t)(src_frames + 8) * sizeof(double));
+    char path[512];
+    wavw_t w;
+    size_t i;
+    double roll20 = 0.0;
+
+    printf("\n== 频响（48k -> 44.1k, 1.0x，窗口 sinc 抗混叠）==\n");
+    for (i = 0; i < sizeof(freqs) / sizeof(freqs[0]); i++) {
+        double f = freqs[i];
+        double amp = 16384.0;                    /* -6dBFS */
+        long n, m;
+        double g, resp_db;
+
+        gen_sine(src, src_frames, f, RATE_SRC, amp);
+        m = resampler_block(src, src_frames, CH, dst, src_frames, step);
+        n = window_left(dst, m, x, src_frames);
+        g = goertzel_mag(x, n, f, RATE);         /* 输出频率 = 源频率（1.0x） */
+        {
+            /* Hann 窗相干增益 0.5：|X| = A*N/4 → A = 4*|X|/N（归一化幅值） */
+            double a_in = amp / 32768.0;
+            double a_out = 4.0 * g / (double)n;
+            resp_db = 20.0 * log10(a_out / a_in);
+        }
+        printf("    %5.0f Hz : %+6.2f dB\n", f, resp_db);
+        if (f == 20000.0) roll20 = resp_db;
+    }
+
+    /* 写出一个扫频 WAV 供人工/频谱图核对 */
+    if (snprintf(path, sizeof path, "%s%caq_sweep.wav", outdir,
+                 (outdir[0] ? '/' : '\0')) > 0) {
+        gen_chirp(src, src_frames, 1000.0, 20000.0, RATE_SRC, 12000.0);
+        if (wav_open(&w, path, RATE_SRC, CH) == 0) {
+            wav_write(&w, src, src_frames, CH);
+            wav_close(&w);
+        }
+    }
+
+    report("freq_resp_20k", roll20 > LIM_ROLLOFF_20K, "20k 响应",
+           ">-6 dB", "");
+    free(src); free(dst); free(x);
+}
+
+/* 混叠分量：48k 源 @2.0x，1k/8k 正弦，最强杂散应 < -40dBc */
+static void test_alias(const char *outdir, double f_src, const char *name)
+{
+    long src_frames = RATE_SRC * 2;              /* 2 秒源 */
+    double step = (double)RATE_SRC * 2.0 / (double)RATE;   /* 2.0x ≈2.177 */
+    int16_t *src = malloc((size_t)src_frames * CH * sizeof(int16_t));
+    int16_t *dst = malloc((size_t)(src_frames + 8) * CH * sizeof(int16_t));
+    double *re = malloc((size_t)FFT_N * sizeof(double));
+    double *im = malloc((size_t)FFT_N * sizeof(double));
+    double *x = malloc((size_t)FFT_N * sizeof(double));
+    char path[512];
+    wavw_t w;
+    long m, n;
+    int fund, i;
+    double sdb;
+    double f_out;
+
+    (void)outdir;
+
+    /* 让输出基频落在 FFT 整数 bin 上：否则 Hann 窗泄漏会把基频邻近 ±3 bin
+     * 抬到 ~-33dBc，污染「最强杂散」口径，与真实混叠/镜像分量无法区分。 */
+    {
+        double k = floor(f_src * 2.0 * (double)FFT_N / (double)RATE + 0.5);
+        f_src = k * (double)RATE / (2.0 * (double)FFT_N);
+    }
+    f_out = f_src * 2.0;                          /* 输出基频（对齐后） */
+
+    gen_sine(src, src_frames, f_src, RATE_SRC, 16384.0);
+    m = resampler_block(src, src_frames, CH, dst, src_frames, step);
+    n = window_left(dst, m, x, FFT_N);
+
+    memset(im, 0, (size_t)FFT_N * sizeof(double));
+    for (i = 0; i < n; i++) re[i] = x[i];
+    for (; i < FFT_N; i++) re[i] = 0.0;
+    fft_radix2(re, im, FFT_N, 0);
+
+    fund = peak_bin(re, im, FFT_N);
+    sdb = spurious_dbc(re, im, FFT_N, fund);
+
+    if (snprintf(path, sizeof path, "%s%caq_%s.wav", outdir,
+                 (outdir[0] ? '/' : '\0'), name) > 0) {
+        if (wav_open(&w, path, RATE, CH) == 0) {
+            wav_write(&w, dst, m, CH);
+            wav_close(&w);
+        }
+    }
+    {
+        char detail[64];
+        snprintf(detail, sizeof detail, "fsrc=%.1f fout=%.1fHz 杂散 %+.1f dBc",
+                 f_src, f_out, sdb);
+        report(name, sdb < LIM_ALIAS_DBC, "杂散 dBc", "<-40 dB", detail);
+    }
+    free(src); free(dst); free(re); free(im); free(x);
+}
+
+/* 抗混叠抑制：上奈奎斯特分量（15k@48k 2.0x → 别名 14.1k）应被压到 < -40dBFS */
+static void test_suppress(const char *outdir)
+{
+    long src_frames = RATE_SRC;
+    double step = (double)RATE_SRC * 2.0 / (double)RATE;
+    double f_src = 15000.0;
+    double f_alias = (double)RATE - 2.0 * f_src; /* 30k 折回 → 14.1k */
+    int16_t *src = malloc((size_t)src_frames * CH * sizeof(int16_t));
+    int16_t *dst = malloc((size_t)(src_frames + 8) * CH * sizeof(int16_t));
+    double *x = malloc((size_t)(src_frames + 8) * sizeof(double));
+    long m, n;
+    double g, amp_norm, dbfs;
+    char detail[96];
+
+    (void)outdir;
+    gen_sine(src, src_frames, f_src, RATE_SRC, 16384.0);
+    m = resampler_block(src, src_frames, CH, dst, src_frames, step);
+    n = window_left(dst, m, x, (int)(src_frames + 8));
+    g = goertzel_mag(x, n, f_alias, RATE);
+    amp_norm = 4.0 * g / (double)n;              /* 归一化幅值（Hann 相干增益 0.5） */
+    dbfs = 20.0 * log10(amp_norm);
+
+    snprintf(detail, sizeof detail, "别名 %.0fHz 残留 %.1f dBFS", f_alias, dbfs);
+    report("alias_suppress_15k", dbfs < LIM_SUPPRESS_DBFS,
+           "上奈奎斯特抑制", "<-40 dBFS", detail);
+    free(src); free(dst); free(x);
+}
+
+/* THD+N：1kHz @ -12dBFS，EQ 中频 +6dB（只测链路线性度，不触发削波） */
+static void test_thd(const char *outdir)
+{
+    long frames = FFT_N;
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    double *re = malloc((size_t)FFT_N * sizeof(double));
+    double *im = malloc((size_t)FFT_N * sizeof(double));
+    double *x = malloc((size_t)FFT_N * sizeof(double));
+    int i, fund;
+    double f, thd;
+    char detail[64];
+
+    (void)outdir;
+    /* 用 FFT 整 bin 频率（≈999.95Hz）落在 bin 中心，避免频谱泄漏抬高 THD+N 本底 */
+    f = 743.0 * RATE / (double)FFT_N;
+    gen_sine(buf, frames, f, RATE, 4096.0);        /* -12dBFS */
+    effect_reset();
+    effect_eq(0, 6, 0);
+    effect_process(buf, (int)frames);
+
+    {
+        long n = window_left(buf, frames, x, FFT_N);
+        memset(im, 0, (size_t)FFT_N * sizeof(double));
+        for (i = 0; i < n; i++) re[i] = x[i];
+        for (; i < FFT_N; i++) re[i] = 0.0;
+        fft_radix2(re, im, FFT_N, 0);
+        fund = peak_bin(re, im, FFT_N);
+        thd = thd_plus_n_pct(re, im, FFT_N, fund);
+    }
+    snprintf(detail, sizeof detail, "THD+N %.4f %%", thd);
+    report("thd_1k", thd < LIM_THD_PCT, "THD+N", "<1 %", detail);
+    free(buf); free(re); free(im); free(x);
+}
+
+/* M5Q-02：EQ 增益切换无 click。DC 输入下把低架从 0 切到 +12dB，测输出一阶
+ * 差分峰值。瞬时切系数+清状态会在一拍内把 DC 从 4000 顶到 ~15920（差分
+ * ~11920），平滑斜坡则差分峰值仅 ~17（<-60dBFS），两者量级差数百倍。 */
+static void test_eq_click(const char *outdir)
+{
+    long frames = RATE;                          /* 1 秒 */
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    long i;
+    int max_step = 0;
+    char detail[96];
+
+    (void)outdir;
+    for (i = 0; i < frames * CH; i++) buf[i] = 4000;   /* 恒定 DC */
+
+    effect_reset();
+    effect_eq(0, 0, 0);                          /* 前半：EQ 关（旁通） */
+    effect_process(buf, (int)(frames / 2));
+
+    effect_eq(12, 0, 0);                         /* 后半：低架 +12dB 切换 */
+    effect_process(buf + (long)(frames / 2) * CH, (int)(frames - frames / 2));
+
+    for (i = 1; i < frames * CH; i++) {
+        int d = buf[i] - buf[i - 1];
+        if (d < 0) d = -d;
+        if (d > max_step) max_step = d;
+    }
+    {
+        double dbfs = (max_step > 0)
+                      ? 20.0 * log10((double)max_step / 32768.0)
+                      : -1000.0;
+        snprintf(detail, sizeof detail, "切换差分峰值 %d（%.1f dBFS）",
+                 max_step, dbfs);
+        report("eq_click_switch", dbfs < LIM_CLICK_DBFS, "切换无爆音",
+               "<-60 dBFS", detail);
+    }
+    free(buf);
+}
+
+/* 削波：-6dBFS 1kHz 正弦 + 三段 EQ +12dB，硬削波（钉在满幅）样本应 = 0。
+ * 选 -6dBFS 输入：信号本身不触满幅，只有 EQ 的 +12dB 把它顶到削波。 */
+static void test_clip(const char *outdir)
+{
+    long frames = RATE;                          /* 1 秒 */
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    long i, clips = 0;
+    char detail[64];
+
+    (void)outdir;
+    gen_sine(buf, frames, 1000.0, RATE, 16384.0);
+    effect_reset();
+    effect_eq(12, 12, 12);
+    effect_process(buf, (int)frames);
+
+    for (i = 0; i < frames * CH; i++)
+        if (buf[i] >= 32767 || buf[i] <= -32768) clips++;
+
+    snprintf(detail, sizeof detail, "硬削波 %ld/%ld 样本", clips, frames * CH);
+    report("clip_fullscale", clips <= LIM_CLIP_SAMPLES, "硬削波样本",
+           "=0", detail);
+    free(buf);
+}
+
+/* 回声衰减：脉冲 → 回声 on(250ms/40%)，数回声次数与衰减 */
+static void test_echo_decay(const char *outdir)
+{
+    long frames = RATE * 2;                      /* 2 秒，够 4+ 次回声 */
+    int delay_samples = DEF_ECHO_DELAY_MS * RATE / 1000;
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    int peak[16];
+    int n = 0, i, win = 64;
+    double ratio_db = 0.0;
+    char detail[96];
+
+    (void)outdir;
+    gen_impulse(buf, frames, 32767.0);
+    effect_reset();
+    effect_echo(DEF_ECHO_DELAY_MS, DEF_ECHO_FB);
+    effect_process(buf, (int)frames);
+
+    /* 在每个延迟整数倍附近找峰值；peak[0] 是原始脉冲，peak[1..] 才是回声 */
+    for (i = 0; i < 16 && (long)i * delay_samples + win < frames; i++) {
+        long center = (long)i * delay_samples;
+        long lo = center - win < 0 ? 0 : center - win;
+        long hi = center + win;
+        long k;
+        int mx = 0;
+        for (k = lo; k <= hi; k++) {
+            int a = buf[k * CH] < 0 ? -buf[k * CH] : buf[k * CH];
+            if (a > mx) mx = a;
+        }
+        if (mx < 33) break;                      /* <-60dBFS 视为不可闻 */
+        peak[n++] = mx;
+    }
+    if (n >= 3 && peak[1] > 0) {
+        double r = (double)peak[2] / (double)peak[1];
+        if (r > 0.0) ratio_db = 20.0 * log10(r);
+    }
+    snprintf(detail, sizeof detail, "回声 %d 次，衰减 %.1f dB/次",
+             n - 1, ratio_db);
+    report("echo_decay", n - 1 >= LIM_ECHO_MIN, "回声次数", ">=3", detail);
+    free(buf);
+}
+
+/* ================= main ================= */
+int main(int argc, char **argv)
+{
+    const char *outdir = ".";
+    int i;
+
+    log_set_level(LOG_ERROR);                    /* 静默 effect/log 内部日志 */
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--outdir") && i + 1 < argc) outdir = argv[++i];
+        else {
+            fprintf(stderr, "用法: %s [--outdir <dir>]\n", argv[0]);
+            return 2;
+        }
+    }
+    MKDIR_P(outdir);                             /* 已存在会失败，忽略 */
+
+    if (effect_init(RATE, CH) != 0) {
+        fprintf(stderr, "效果链初始化失败\n");
+        return 1;
+    }
+
+    printf("========================================================\n");
+    printf(" 离线音质报告（M5Q-07） rate=%d ch=%d\n", RATE, CH);
+    printf("========================================================\n");
+
+    test_freq_response(outdir);
+    test_alias(outdir, 1000.0, "alias_1k_2x");
+    test_alias(outdir, 8000.0, "alias_8k_2x");
+    test_suppress(outdir);
+    test_thd(outdir);
+    test_eq_click(outdir);
+    test_clip(outdir);
+    test_echo_decay(outdir);
+
+    effect_finish();
+
+    printf("--------------------------------------------------------\n");
+    printf(" 结果：%s（%d 项失败）\n",
+           g_fails == 0 ? "全部通过" : "存在失败", g_fails);
+    return g_fails;
+}

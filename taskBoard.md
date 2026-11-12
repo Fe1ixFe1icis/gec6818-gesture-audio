@@ -167,6 +167,15 @@
 >
 > **顺序**：先 M5Q-07（有客观尺子）→ M5Q-01/02/04（最影响“粗糙”）→ M5Q-03（回声）→ 05/06/09。
 > P0 不要等到 11/25：插在 11/14–15 周末与 M3 并行，M4 演示前必须过 M5Q-08。
+>
+> **进度（2026-11-12）**：
+> - **M5Q-07 已完成 ✅** —— `tools/audio_quality.c` + `make audio_quality`（链接真实 `src/effect.c`/`src/resample.c`/`src/log.c`，主机一键出报告）。
+> - **M5Q-01 已完成 ✅** —— 新增 `src/resample.c`/`src/resample.h`（窗口 sinc + Blackman，64 抽头 / 256 相位；step>1 时按 step 拉宽核，先低通再抽取），`player.c` 改用同一实现，`audio_quality` 也改链真实 `resampler_block()`。主机 `make` 零警告、`selftest` 19 过 0 败 1 跳。
+>   改后报告：`freq_resp_20k` −0.00 dB、`alias_1k_2x` −82.5 dBc、`alias_8k_2x` −64.5 dBc、`alias_suppress_15k` −97.9 dBFS、`thd_1k` 0.0083%、`echo_decay` 7 次 −8.0 dB/次，全部 PASS。
+>   注：`alias_8k_2x` 首版 −33.4 dBc 是 Hann 窗泄漏（输出 16kHz 非整 bin），非重采样缺陷——把测试源频率对齐到输出整 bin 后测到真实杂散 −64.5 dBc。
+> - **M5Q-04 已完成 ✅** —— `src/effect.c` 新增 `soft_limit()`（0.9FS 软拐点 + 渐近饱和，线性区零失真），替换回声输出与 EQ 输出的硬 clamp。`clip_fullscale` 58782/88200 → 0/88200 样本硬削波；`thd_1k` 0.0083% 不变，`selftest` 19 过 0 败。
+> - **M5Q-02 已完成 ✅** —— `src/effect.c` 新增增益斜坡：`effect_set_cfg` 只更新目标增益并算每采样步长，`effect_process` 每采样推进 `s_eq_cur_gain` 并按当前增益重算 biquad 系数，`eq_recalc` 切系数**保留 z1/z2**（不再清零）；EQ 关闭（旁通）时把残余斜坡直接落到目标并清状态。`tools/audio_quality.c` 新增 `eq_click_switch` 用例（DC 输入下低架 0→+12dB 切换，测输出一阶差分峰值）。改后报告：`eq_click_switch` 差分峰值 16（−66.2 dBFS，阈值 < −60 dBFS）PASS；全 8 项 PASS，`thd_1k`/`clip_fullscale`/`echo_decay` 不受影响，`selftest` 19 过 0 败 1 跳。
+> - **待办**：M5Q-03（回声阻尼/干湿/延迟切换），为后续项。
 
 ---
 
