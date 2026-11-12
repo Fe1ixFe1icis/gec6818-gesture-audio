@@ -6,6 +6,8 @@
 
 **当前进度：M1 首版基线（v0.1.0-m1）** —— 接口、构建、日志、并发仲裁、四模块骨架、主机模拟后端、板端测试文档齐备；
 D1/D2/D3（EOF 后切歌停摆、PAUSE 不上报、ERROR 不上报）已修复并通过主机回归 20/20；
+M5 音效 P0/P1 已量化（抗混叠/软限幅/EQ 平滑/回声阻尼/DC 阻断/预设）；
+M6 客户端与协议矩阵主机侧完成（60 项通过），远程链路仍受 eth0 阻塞；
 传感器真机、LCD 中文字库、MP3 解码按里程碑推进。
 
 ## 文档索引
@@ -45,9 +47,13 @@ src/              板端源码
   server.c        TCP 服务器：协议解析、状态周期广播
   selftest.c      内置 20 项自检（不依赖声卡/LCD/传感器）
 client/           PC 客户端（M6）
+  gesture_client.py  Tkinter GUI + CLI：全指令、500ms 状态、断线自动重连
+  README.md          客户端用法与心跳/重连说明
 tools/
   gen_wav.c       测试素材生成器（1s 双音 + 1s 静音循环）
   netctl.py       命令行 TCP 客户端（现场测试用）
+  protocol_matrix.py    M6-02 协议矩阵/4 连接/500ms 推送/重连（主机回环一键跑）
+  client_link_test.py   M6-01 客户端心跳/重连回归（Python 假服务器）
   armbuild.sh     Ubuntu 侧一键交叉编译 + ABI 校验（BOARD=1）
   pack_for_ubuntu.ps1  Windows 侧打包成可导入 Ubuntu 的源码 tar.gz
   player_regress.py    主机侧 D1/D2/D3 状态机回归（自带 WAV 合成）
@@ -88,7 +94,7 @@ bash tools/armbuild.sh
 > ⚠️ **工具链前缀必须与板端 loader 一致**。本板实测是 `/lib/ld-linux.so.3`
 > （软浮点，glibc 2.23），对应 `arm-linux-gcc`（`arm-none-linux-gnueabi`）；
 > 用 `gnueabihf` 编出的程序会要求 `/lib/ld-linux-armhf.so.3`，在本板报
-> `No such file or directory`。详见 `boardGuide.md §2.5`。
+> `No such file or directory`。详见 `boardGuide.md §2.（`。
 
 ## 运行
 
@@ -103,7 +109,11 @@ bash tools/armbuild.sh
 ./build/gesture_audio --dump-bmp /tmp/ui.bmp
 
 # 远程控制
-python3 tools/netctl.py <板子IP> 8888 "VOL 70" "SPEED 1.5" "STATUS"
+python3 tools/netctl.py <板子IP> 8888 "VOL 70" "SPEED 1.（" "STATUS"
+
+# PC 客户端（GUI；Windows 无 python 别名时用 py -3.11）
+py -3.11 client/gesture_client.py --host <板子IP> --port 8888
+py -3.11 client/gesture_client.py --cli --host <板子IP> --cmd "STATUS" --cmd "VOL 70"
 
 # EQ 预设 A/B（内部预设，不发协议）
 ./build/gesture_audio --eq-preset vocal --sensor sim audio/test_44100.wav

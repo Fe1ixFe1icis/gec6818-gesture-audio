@@ -385,6 +385,14 @@ python tools/netctl.py <板子IP> --clients 5
 任何已连接客户端每 500ms 收到一行 `STATUS …`（无需请求）。
 `tools/netctl.py` 默认只打印回执，加 `--show-status` 才显示推送——避免推送淹没回执。
 
+> **M6-01/02 主机侧自动化（2026-11-12）**：`tools/protocol_matrix.py` **60/0**
+> 覆盖全部指令/越界、STATUS 字段、500ms 推送（实测 537–563ms）、4 连接上限与槽位释放、
+> 半包/粘包/空行/超长行/QUIT、断线重连。PC 客户端 `client/gesture_client.py`
+> 已提供 GUI 与 `--cli`；`--gui-smoke` PASS，`tools/client_link_test.py` **7/7**
+> （连接/心跳/断开/同端口重连/重连后指令）。
+> 同时修了 STATUS 在 EOF/STOPPED 下取播放线程旧参数的问题：`server_format_status()`
+> 现在直接合并 `params_get()` 的当前值，任何状态都能看到刚下发的音量/速度/回声。
+
 #### T4.4 QUIT / 超长行
 
 - `QUIT` → 回 `OK BYE` 并断开，`clients` 减 1。
