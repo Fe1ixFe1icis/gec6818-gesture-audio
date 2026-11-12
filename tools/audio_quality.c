@@ -7,7 +7,8 @@
  * 覆盖（对应 taskBoard.md §3.4）：
  *   - 重采样器（链接真实 src/resample.c 的抗混叠窗口 sinc，M5Q-01 共用）：
  *     频响、混叠分量、抗混叠抑制
- *   - 效果链（链接真实 src/effect.c）：THD+N、削波、回声衰减
+ *   - 效果链（链接真实 src/effect.c）：THD+N、削波、EQ 切换爆音、回声衰减/
+ *     反馈阻尼/改延迟爆音/90% 反馈稳定性/wet-dry（M5Q-02/03/04）
  *   - 信号：正弦（单频/扫频）、脉冲、粉噪
  *
  * 重采样器直接链接 src/resample.c：与板端 player.c 共用同一实现，保证
@@ -31,6 +32,7 @@
 #include <stdint.h>
 
 #include "effect.h"     /* 真实效果链（链接 src/effect.c） */
+#include "effect_ext.h" /* M5Q-03 内部扩展：wet/dry（非冻结接口） */
 #include "resample.h"   /* 真实抗混叠重采样（链接 src/resample.c，M5Q-01 共用） */
 #include "config.h"     /* AUDIO_RATE_HZ 等 */
 #include "common.h"     /* log 宏（链接 src/log.c，本工具设成 ERROR 静默） */
@@ -60,6 +62,8 @@
 #define LIM_CLIP_SAMPLES   0       /* 硬削波样本数上限（M5Q-04） */
 #define LIM_ECHO_MIN       3       /* 最少可闻回声次数（M5Q-03） */
 #define LIM_CLICK_DBFS     -60.0   /* EQ 切换 click 峰值上限 dBFS（M5Q-02） */
+#define LIM_ECHO_DAMP_DB   -3.0    /* 8k 每遍额外衰减下限 dB（M5Q-03 反馈阻尼） */
+#define LIM_ECHO_SWITCH_DBFS -15.0 /* 改延迟时一阶差分峰值上限 dBFS（M5Q-03） */
 
 static int g_fails = 0;
 
@@ -305,6 +309,21 @@ static void effect_echo(int delay_ms, int fb)
     c.echo_delay_ms = delay_ms;
     c.echo_fb = fb;
     effect_set_cfg(&c);
+}
+
+/* 左声道 [lo, hi] 帧内的峰值（越界自动收紧） */
+static int peak_in(const int16_t *buf, long lo, long hi)
+{
+    long i;
+    int mx = 0;
+
+    if (lo < 0) lo = 0;
+    for (i = lo; i <= hi; i++) {
+        int a = buf[i * CH];
+        if (a < 0) a = -a;
+        if (a > mx) mx = a;
+    }
+    return mx;
 }
 
 /* ================= 测试用例 ================= */
@@ -580,6 +599,158 @@ static void test_echo_decay(const char *outdir)
     free(buf);
 }
 
+/* M5Q-03 阻尼：100ms 延迟、fb=60，比较 1k 与 8k 短音的第 1→2 次回声峰值比。
+ * 4kHz 一阶低通对 8k 每遍约 -9.5dB，对 1k 几乎无损；若反馈无阻尼，两者
+ * 比值应基本相同（damp≈0dB）。 */
+static void test_echo_damping(const char *outdir)
+{
+    const int delay_ms = 100;
+    const long frames = RATE;                    /* 1 秒，够 3 次回声 */
+    const double freqs[2] = { 1000.0, 8000.0 };
+    double ratio[2] = { 0.0, 0.0 };
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    long burst = RATE * 30 / 1000;               /* 30ms 短音，不碰下一次回声 */
+    int k;
+    char detail[128];
+
+    (void)outdir;
+    for (k = 0; k < 2; k++) {
+        long i, d = (long)delay_ms * RATE / 1000;
+        long span = RATE * 40 / 1000;
+        int p1, p2;
+
+        memset(buf, 0, (size_t)frames * CH * sizeof(int16_t));
+        for (i = 0; i < burst; i++) {
+            double env = 0.5 - 0.5 * cos(2.0 * M_PI * (double)i / (double)(burst - 1));
+            int16_t s = to_i16(12000.0 * env
+                               * sin(2.0 * M_PI * freqs[k] * (double)i / RATE));
+            buf[i * CH] = buf[i * CH + 1] = s;
+        }
+        effect_reset();
+        effect_echo(delay_ms, 60);
+        effect_process(buf, (int)frames);
+
+        p1 = peak_in(buf, d - 64, d + span);
+        p2 = peak_in(buf, 2 * d - 64, 2 * d + span);
+        ratio[k] = (p1 > 0) ? (double)p2 / (double)p1 : 0.0;
+    }
+    {
+        double damp_db = (ratio[0] > 0.0 && ratio[1] > 0.0)
+                         ? 20.0 * log10(ratio[1] / ratio[0]) : 0.0;
+        snprintf(detail, sizeof detail,
+                 "1k 每遍 ×%.2f，8k 每遍 ×%.2f，阻尼 %+.1f dB/遍",
+                 ratio[0], ratio[1], damp_db);
+        report("echo_damping", ratio[0] > 0.45 && damp_db < LIM_ECHO_DAMP_DB,
+               "8k 反馈阻尼", "<-3 dB/遍", detail);
+    }
+    free(buf);
+}
+
+/* M5Q-03 改延迟无爆音：1s 连续 1234Hz（非整数周期/ms，改延迟必产生相位跳变）
+ * → 200ms 切到 275ms。测切换后 300ms 内的一阶差分峰值；硬跳变会产生
+ * 近满幅台阶（>-12dBFS），20ms 交叉淡化应保持在自然波形斜率量级。 */
+static void test_echo_delay_switch(const char *outdir)
+{
+    const long frames = RATE * 2;
+    const long half = frames / 2;
+    const double f = 1234.0;
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    long i;
+    int base = 0, sw = 0;
+    char detail[128];
+
+    (void)outdir;
+    gen_sine(buf, frames, f, RATE, 8000.0);
+
+    effect_reset();
+    effect_echo(200, 40);
+    effect_process(buf, (int)half);
+
+    effect_echo(275, 40);                        /* 75ms 延迟跳变 → 相位 0.55 周 */
+    effect_process(buf + half * CH, (int)(frames - half));
+
+    for (i = half - RATE * 3 / 10; i < half; i++) {
+        int d = buf[i * CH] - buf[(i - 1) * CH];
+        if (d < 0) d = -d;
+        if (d > base) base = d;
+    }
+    for (i = half; i < half + RATE * 3 / 10; i++) {
+        int d = buf[i * CH] - buf[(i - 1) * CH];
+        if (d < 0) d = -d;
+        if (d > sw) sw = d;
+    }
+    {
+        double dbfs = (sw > 0) ? 20.0 * log10((double)sw / 32768.0) : -1000.0;
+        snprintf(detail, sizeof detail,
+                 "切换差分 %d（%.1f dBFS），稳态基线 %d", sw, dbfs, base);
+        report("echo_delay_switch", dbfs < LIM_ECHO_SWITCH_DBFS,
+               "改延迟无爆音", "<-15 dBFS", detail);
+    }
+    free(buf);
+}
+
+/* M5Q-03 90% 反馈不自激：脉冲 → 5 秒、fb=90、250ms。有阻尼时环路增益
+ * <1（4k 低通对高频额外衰减），末段应明显低于第 2 次回声且无硬削波。 */
+static void test_echo_self_osc(const char *outdir)
+{
+    const long frames = RATE * 5;
+    long d = 250L * RATE / 1000;
+    int16_t *buf = calloc((size_t)frames * CH, sizeof(int16_t));
+    int e2, last, clips = 0;
+    long i;
+    char detail[128];
+
+    (void)outdir;
+    buf[0] = buf[1] = 30000;
+    effect_reset();
+    effect_echo(250, 90);
+    effect_process(buf, (int)frames);
+
+    e2   = peak_in(buf, 2 * d - 64, 2 * d + 64);
+    last = peak_in(buf, frames - RATE / 10, frames - 1);
+    for (i = 0; i < frames * CH; i++)
+        if (buf[i] >= 32767 || buf[i] <= -32768) clips++;
+
+    snprintf(detail, sizeof detail,
+             "第2次回声 %d，末 100ms 峰值 %d，硬削波 %d", e2, last, clips);
+    report("echo_self_osc", e2 > 33 && last * 2 < e2 && clips == 0,
+           "90% 反馈不自激", "衰减且无硬削", detail);
+    free(buf);
+}
+
+/* M5Q-03 wet/dry 可配：wet=0 时回声位置必须为静音，恢复默认 0.70 后
+ * 同一位置应有明显回声。验证内部 setter 真的生效（不改冻结结构体）。 */
+static void test_echo_mix(const char *outdir)
+{
+    const long frames = RATE / 2;
+    long d = 100L * RATE / 1000;
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    int echo_off, echo_on;
+    char detail[96];
+
+    (void)outdir;
+    memset(buf, 0, (size_t)frames * CH * sizeof(int16_t));
+    buf[0] = buf[1] = 20000;
+    effect_reset();
+    effect_echo(100, 30);
+    effect_echo_set_mix(0.0f, 1.0f);             /* 全干 */
+    effect_process(buf, (int)frames);
+    echo_off = peak_in(buf, d - 32, d + 32);
+
+    memset(buf, 0, (size_t)frames * CH * sizeof(int16_t));
+    buf[0] = buf[1] = 20000;
+    effect_reset();
+    effect_echo_set_mix(0.70f, 1.00f);           /* 恢复默认 */
+    effect_process(buf, (int)frames);
+    echo_on = peak_in(buf, d - 32, d + 32);
+
+    snprintf(detail, sizeof detail, "wet=0 回声 %d，wet=0.7 回声 %d",
+             echo_off, echo_on);
+    report("echo_wet_mix", echo_off < 33 && echo_on > 5000,
+           "wet/dry 可配", "0 静音 / 默认有声", detail);
+    free(buf);
+}
+
 /* ================= main ================= */
 int main(int argc, char **argv)
 {
@@ -613,6 +784,10 @@ int main(int argc, char **argv)
     test_eq_click(outdir);
     test_clip(outdir);
     test_echo_decay(outdir);
+    test_echo_damping(outdir);
+    test_echo_delay_switch(outdir);
+    test_echo_self_osc(outdir);
+    test_echo_mix(outdir);
 
     effect_finish();
 
