@@ -10,6 +10,8 @@
  *   - 02 EQ 增益 30ms 斜坡 + 切系数保留 z1/z2（无咔哒）
  *   - 03 回声预分配延迟线、反馈 4kHz 阻尼、改延迟 20ms 交叉淡化、wet/dry
  *   - 04 soft_limit 软限幅替代硬 clamp（0.9FS 拐点，线性区零失真）
+ *   - 05 21Hz 二阶 Butterworth 高通（亚声/DC 阻断，链首）
+ *   - 06 EQ 频点 120Hz/1kHz Q0.7/6kHz 起步 + standard/vocal/demo 内部预设
  *
  * 数值：全 float 单精度。板子有 VFPv4，44.1k 立体声下本链 < 100 cycles/采样
  *       （boardGuide.md §4.1），余量两个数量级，无需为性能改定点。
@@ -38,6 +40,37 @@ static float    s_eq_gain[3];              /* 目标增益 dB（M5Q-02：斜坡�
 static float    s_eq_cur_gain[3];          /* 当前实际生效增益 dB（斜坡起点） */
 static float    s_eq_step[3];              /* 每采样增益斜坡 dB（0 = 已到位） */
 static int      s_eq_primed;               /* 是否已收到首次 set_cfg */
+
+/* M5Q-06：EQ 预设只改**频点/Q**，增益仍由 effect_cfg_t（协议/手势）控制，
+ * 因此不动冻结结构体。standard 即任务要求的 120Hz / 1kHz Q0.7 / 6kHz。 */
+typedef struct {
+    const char *name;
+    float low_hz;
+    float mid_hz;
+    float mid_q;
+    float high_hz;
+} eq_preset_t;
+
+static const eq_preset_t EQ_PRESETS[] = {
+    { "standard", 120.0f, 1000.0f, 0.70f, 6000.0f },
+    { "vocal",    160.0f, 1200.0f, 1.00f, 5000.0f },
+    { "demo",     100.0f, 1000.0f, 0.70f, 8000.0f },
+};
+#define EQ_PRESET_COUNT ((int)(sizeof EQ_PRESETS / sizeof EQ_PRESETS[0]))
+
+static int      s_eq_preset;               /* 当前预设索引 */
+static biquad_t s_eq_old[3][AUDIO_CHANNELS]; /* 预设切换时的旧滤波器（含状态） */
+static int      s_eq_xf_pos;               /* 预设切换交叉淡化进度（帧） */
+static int      s_eq_xf_len;               /* 预设切换交叉淡化总长（帧，0=未进行） */
+#define EQ_PRESET_XFADE_MS 30              /* 预设切换系数交叉淡化时长 */
+
+/* ---------------- 亚声高通 / DC 阻断（M5Q-05） ---------------- */
+/* 二阶 Butterworth 高通，标称 20Hz 档。-3dB 点取 21Hz：10Hz 处约 -13dB，
+ * 既满足“20Hz 以下衰减 > 12dB”，又尽量少碰 20–40Hz 的低频体感。 */
+#define HPF_HZ   21.0f
+#define HPF_Q    0.70710678f
+static biquad_t s_hpf[AUDIO_CHANNELS];
+
 
 /* ---------------- 回声 ---------------- */
 /* M5Q-03：延迟线按 **最大 800ms** 一次分配，改延迟只改读写指针 + 交叉淡化，
@@ -156,12 +189,13 @@ static void eq_recalc(int band)
 {
     int ch;
     float gain = s_eq_cur_gain[band];
+    const eq_preset_t *ps = &EQ_PRESETS[s_eq_preset];
     biquad_t f;
 
     memset(&f, 0, sizeof f);
-    if (band == 0)      eq_low_shelf(&f, (float)s_rate, 200.0f, gain);
-    else if (band == 1) eq_peaking(&f, (float)s_rate, 1000.0f, 0.7f, gain);
-    else                eq_high_shelf(&f, (float)s_rate, 4000.0f, gain);
+    if (band == 0)      eq_low_shelf(&f, (float)s_rate, ps->low_hz, gain);
+    else if (band == 1) eq_peaking(&f, (float)s_rate, ps->mid_hz, ps->mid_q, gain);
+    else                eq_high_shelf(&f, (float)s_rate, ps->high_hz, gain);
 
     for (ch = 0; ch < s_channels && ch < AUDIO_CHANNELS; ch++) {
         /* M5Q-02：切系数**保留** z1/z2（不清状态）。清状态会把滤波器内部
@@ -180,6 +214,26 @@ static inline float bq_process(biquad_t *f, float x)
     f->z1 = f->b1 * x - f->a1 * y + f->z2;
     f->z2 = f->b2 * x - f->a2 * y;
     return y;
+}
+
+/* M5Q-05：RBJ 二阶高通（Butterworth Q=0.707），每声道共用系数、独立状态。 */
+static void hpf_recalc(void)
+{
+    float w0    = 2.0f * 3.14159265f * HPF_HZ / (float)s_rate;
+    float cosw  = cosf(w0);
+    float sinw  = sinf(w0);
+    float alpha = sinw / (2.0f * HPF_Q);
+    float a0    = 1.0f + alpha;
+    int ch;
+
+    for (ch = 0; ch < AUDIO_CHANNELS; ch++) {
+        biquad_t *f = &s_hpf[ch];
+        f->b0 = (1.0f + cosw) * 0.5f / a0;
+        f->b1 = -(1.0f + cosw) / a0;
+        f->b2 = (1.0f + cosw) * 0.5f / a0;
+        f->a1 = -2.0f * cosw / a0;
+        f->a2 = (1.0f - alpha) / a0;
+    }
 }
 
 /* ---------------- 延迟线（M5Q-03） ---------------- */
@@ -285,12 +339,19 @@ int effect_init(int rate, int channels)
         s_eq_step[band]     = 0.0f;
     }
     s_eq_primed = 0;
+    s_eq_preset = 0;
+    s_eq_xf_pos = s_eq_xf_len = 0;
     /* 初始化为单位增益（b0=1），保证首次 set_cfg 前的任何处理都等同旁通 */
     for (band = 0; band < 3; band++)
         for (ch = 0; ch < AUDIO_CHANNELS; ch++) {
             memset(&s_eq[band][ch], 0, sizeof s_eq[band][ch]);
             s_eq[band][ch].b0 = 1.0f;
+            memset(&s_eq_old[band][ch], 0, sizeof s_eq_old[band][ch]);
         }
+    /* M5Q-05：亚声高通系数按当前采样率计算，状态在 reset 里清 */
+    hpf_recalc();
+    for (ch = 0; ch < AUDIO_CHANNELS; ch++)
+        s_hpf[ch].z1 = s_hpf[ch].z2 = 0.0f;
     if (echo_alloc_max() != 0)
         return -1;
     effect_reset();
@@ -317,7 +378,12 @@ void effect_reset(void)
         for (ch = 0; ch < AUDIO_CHANNELS; ch++) {
             s_eq[band][ch].z1 = 0.0f;
             s_eq[band][ch].z2 = 0.0f;
+            s_eq_old[band][ch].z1 = 0.0f;
+            s_eq_old[band][ch].z2 = 0.0f;
         }
+    s_eq_xf_pos = s_eq_xf_len = 0;      /* 切歌不做预设交叉淡化 */
+    for (ch = 0; ch < AUDIO_CHANNELS; ch++)
+        s_hpf[ch].z1 = s_hpf[ch].z2 = 0.0f;
     /* M5Q-03：切歌清延迟线是必要的（旧音频不能串到新曲目），
      * 但**改延迟**不再走这里——见 echo_set_delay()。 */
     echo_clear();
@@ -393,6 +459,55 @@ void effect_echo_set_mix(float wet, float dry)
     LOGD(TAG, "回声 wet/dry = %.2f / %.2f", wet, dry);
 }
 
+/* M5Q-06：EQ 预设内部扩展（声明在 src/effect_ext.h）。只影响频点/Q，
+ * 增益仍由 effect_cfg_t 控制；切换时旧/新滤波器并行 30ms 交叉淡化。 */
+int effect_eq_preset_count(void)
+{
+    return EQ_PRESET_COUNT;
+}
+
+const char *effect_eq_preset_name(int preset)
+{
+    if (preset < 0 || preset >= EQ_PRESET_COUNT) return "?";
+    return EQ_PRESETS[preset].name;
+}
+
+int effect_eq_preset(void)
+{
+    return s_eq_preset;
+}
+
+void effect_eq_set_preset(int preset)
+{
+    int band, ch;
+
+    if (preset < 0) preset = 0;
+    if (preset >= EQ_PRESET_COUNT) preset = EQ_PRESET_COUNT - 1;
+    if (preset == s_eq_preset) return;
+
+    if (!s_inited || !s_eq_primed) {
+        /* 还没开始处理：只记下选择，首次 set_cfg 时按新频点算系数 */
+        s_eq_preset = preset;
+        return;
+    }
+
+    /* 旧滤波器（含状态）整体留一份；新滤波器从同一状态继续，输出按
+     * 30ms 斜坡混合，避免系数瞬变把内部能量一次性倒出来（“咔/爆”）。 */
+    for (band = 0; band < 3; band++)
+        for (ch = 0; ch < AUDIO_CHANNELS; ch++)
+            s_eq_old[band][ch] = s_eq[band][ch];
+
+    s_eq_preset = preset;
+    for (band = 0; band < 3; band++)
+        eq_recalc(band);            /* 保留 z1/z2，新系数从旧状态起步 */
+
+    s_eq_xf_pos = 0;
+    s_eq_xf_len = (int)((long)s_rate * EQ_PRESET_XFADE_MS / 1000);
+    if (s_eq_xf_len < 1) s_eq_xf_len = 1;
+    LOGD(TAG, "EQ 预设 → %s（%d 帧交叉淡化）",
+         EQ_PRESETS[preset].name, s_eq_xf_len);
+}
+
 int effect_active(void)
 {
     if (!s_inited) return 0;
@@ -427,6 +542,17 @@ void effect_process(int16_t *buf, int frames)
         if (!s_cfg.echo_on) {
             s_echo_was_on = 0;                /* 全关：旁通快路径 */
             return;
+        }
+    }
+
+    /* 0) 亚声高通 / DC 阻断（M5Q-05）：放在回声与 EQ 之前。
+     * 直流若进入回声反馈会一直累积，进入低架 +12dB 会被放大再削波；
+     * 先挡掉最省事。全关时仍走上面的 bypass 快路径，保持逐字节一致。 */
+    for (i = 0; i < frames; i++) {
+        int base = i * s_channels;
+        for (ch = 0; ch < s_channels; ch++) {
+            float y = bq_process(&s_hpf[ch], (float)buf[base + ch]);
+            buf[base + ch] = (int16_t)soft_limit(y);
         }
     }
 
@@ -510,11 +636,21 @@ void effect_process(int16_t *buf, int frames)
             }
             for (ch = 0; ch < s_channels; ch++) {
                 float x = (float)buf[base + ch];
-                x = bq_process(&s_eq[0][ch], x);
-                x = bq_process(&s_eq[1][ch], x);
-                x = bq_process(&s_eq[2][ch], x);
+                /* M5Q-06：预设切换时旧/新滤波器并行，30ms 交叉淡化输出 */
+                for (band = 0; band < 3; band++) {
+                    float yn = bq_process(&s_eq[band][ch], x);
+                    if (s_eq_xf_len > 0) {
+                        float t  = (float)s_eq_xf_pos / (float)s_eq_xf_len;
+                        float yo = bq_process(&s_eq_old[band][ch], x);
+                        x = yo + (yn - yo) * t;
+                    } else {
+                        x = yn;
+                    }
+                }
                 buf[base + ch] = (int16_t)soft_limit(x);
             }
+            if (s_eq_xf_len > 0 && ++s_eq_xf_pos >= s_eq_xf_len)
+                s_eq_xf_len = 0;
         }
     }
 }
