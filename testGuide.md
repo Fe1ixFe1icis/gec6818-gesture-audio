@@ -317,6 +317,21 @@ python tools/netctl.py <板子IP> "ECHO on 250 40" "EQ mid 6" "EQ low -6" STATUS
 > −25.8 dBFS、`echo_self_osc`（fb=90）末段衰减且零硬削、`echo_wet_mix` 0/14000。
 > **板端听感与改延迟复测仍需按本节在 COM3 上执行并补记录。**
 
+> **M5Q-05/06 主机侧已量化（2026-11-12）**：新增 21Hz 二阶高通（10Hz −13.1dB、
+> 1kHz −0.01dB；DC 4000 + 三段 +12dB 残留 0 LSB）；EQ 频点改为
+> **低架 120Hz / 峰 1kHz Q0.7 / 高架 6kHz**，另有三套内部预设。离线结果：
+> 低架 +12dB 时 60Hz +11.0dB、1k +0.00dB；峰 +12dB 时 1k +11.9dB、60Hz +0.05、
+> 10k +0.22；高架 +12dB 时 10k +10.9dB、1k +0.01；预设切换二阶差分 7/7
+> （无交叉淡化对照 99/7）。板端 A/B 用：
+>
+> ```bash
+> ./gesture_audio --eq-preset standard --sensor sim audio/test_44100.wav
+> ./gesture_audio --eq-preset vocal    --sensor sim audio/test_44100.wav
+> ./gesture_audio --eq-preset demo     --sensor sim audio/test_44100.wav
+> ```
+>
+> 听感重点：120Hz 低架不再“轰头”、6kHz 高架不刺耳、三套预设切换无“咔/爆”。
+
 ### T4 TCP 协议
 
 #### T4.1 指令与回执（✅ 本机通过）

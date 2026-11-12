@@ -40,7 +40,7 @@ src/              板端源码
   sensor.c        手势与测距（sim 后端可用；i2c 为 M2 占位）
   player.c        WAV 读取 → 变速重采样 → 效果链 → 音量 → ALSA/空 sink
   resample.c      抗混叠重采样（窗口 sinc，M5Q-01；player 与离线工具共用）
-  effect.c        回声（预分配延迟线 + 反馈阻尼 + 改延迟交叉淡化）+ 三段 EQ（biquad）
+  effect.c        回声（预分配延迟线 + 反馈阻尼 + 改延迟交叉淡化）+ 21Hz 高通 + 三段 EQ（biquad，含预设）
   display.c       LCD 800×480 双缓冲 + 5×7 点阵字库；主机侧可导 BMP
   server.c        TCP 服务器：协议解析、状态周期广播
   selftest.c      内置 20 项自检（不依赖声卡/LCD/传感器）
@@ -52,7 +52,7 @@ tools/
   pack_for_ubuntu.ps1  Windows 侧打包成可导入 Ubuntu 的源码 tar.gz
   player_regress.py    主机侧 D1/D2/D3 状态机回归（自带 WAV 合成）
   prep_demo_wav.py     大 WAV 裁剪/降混/重采样（串口部署前压缩体积）
-  audio_quality.c      离线音质测试工具（M5Q-07：THD+N/混叠/削波/回声/EQ 切换/回声阻尼与改延迟，主机一键报告）
+  audio_quality.c      离线音质测试工具（M5Q-07：THD+N/混叠/削波/EQ 三频与预设/DC 阻断/回声，主机一键报告）
   make_serial_upload.ps1  无 rz/rb 时生成 base64 串口上传脚本
   i2c_probe.c     单地址 I2C 探测（M2 确认 0x73，避免全总线盲扫）
 ```
@@ -104,10 +104,14 @@ bash tools/armbuild.sh
 
 # 远程控制
 python3 tools/netctl.py <板子IP> 8888 "VOL 70" "SPEED 1.5" "STATUS"
+
+# EQ 预设 A/B（内部预设，不发协议）
+./build/gesture_audio --eq-preset vocal --sensor sim audio/test_44100.wav
 ```
 
 常用选项：`--port` / `--sensor sim|i2c` / `--no-display` / `--run <秒>` /
-`--log error|warn|info|debug` / `--selftest` / `--dump-bmp`，`--help` 看全部。
+`--eq-preset standard|vocal|demo` / `--log error|warn|info|debug` /
+`--selftest` / `--dump-bmp`，`--help` 看全部。
 
 ## 架构要点（读代码前先看这三条）
 
