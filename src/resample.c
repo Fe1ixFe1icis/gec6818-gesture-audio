@@ -28,7 +28,8 @@ static double sinc_pi(double x)
     return sin(M_PI * x) / (M_PI * x);
 }
 
-/* 按当前 step 重建分数相位系数表（已按各相位和归一化 → 直流增益恒为 1） */
+/* 按当前 step 重建分数相位系数表（已按各相位和归一化 → 直流增益恒为 1）。
+ * 表内用 float 存储：板端软浮点 ABI 下 double 乘加代价过高。 */
 static void rebuild_coeff(resampler_t *r)
 {
     const int half = RS_TAPS / 2;
@@ -42,11 +43,13 @@ static void rebuild_coeff(resampler_t *r)
             double d = (double)(t - (half - 1)) - frac;   /* 与理想位置的距离 */
             double x = d / L;
             double w = sinc_pi(x) * blackman(d / (double)half);
-            r->coeff[p][t] = w;
+            r->coeff[p][t] = (float)w;
             sum += w;
         }
         if (sum != 0.0) {
-            for (t = 0; t < RS_TAPS; t++) r->coeff[p][t] /= sum;
+            double inv = 1.0 / sum;
+            for (t = 0; t < RS_TAPS; t++)
+                r->coeff[p][t] = (float)((double)r->coeff[p][t] * inv);
         }
     }
 }
@@ -76,27 +79,34 @@ int resampler_process(resampler_t *r, const int16_t *in, int in_frames,
 
     while (produced < out_max) {
         int i0 = (int)r->pos;
-        double frac;
-        int phase, base, t, c;
+        float frac;
+        int phase, base, t0 = 0, t1 = RS_TAPS, t, c;
+        const float *coef;
 
         if (i0 + half >= in_frames) break;      /* 源不够，等下一块 */
 
-        frac = r->pos - (double)i0;
-        phase = (int)(frac * (double)RS_PHASES);
+        frac = (float)(r->pos - (double)i0);
+        phase = (int)(frac * (float)RS_PHASES);
         if (phase >= RS_PHASES) phase = RS_PHASES - 1;
         if (phase < 0) phase = 0;
         base = i0 - (half - 1);
+        if (base < 0) {                         /* 开头不足半个核：从 0 截断 */
+            t0 = -base;
+            base = 0;
+        }
+        if (base + RS_TAPS > in_frames)
+            t1 = in_frames - base;
+        coef = r->coeff[phase];
 
         for (c = 0; c < ch; c++) {
-            double acc = 0.0;
-            for (t = 0; t < RS_TAPS; t++) {
-                int idx = base + t;
-                if (idx < 0) idx = 0;
-                if (idx >= in_frames) idx = in_frames - 1;
-                acc += (double)in[idx * ch + c] * r->coeff[phase][t];
-            }
-            if (acc > 32767.0) acc = 32767.0;
-            else if (acc < -32768.0) acc = -32768.0;
+            const int16_t *p = in + (size_t)base * ch + c;
+            float acc = 0.0f;
+
+            for (t = t0; t < t1; t++)
+                acc += (float)p[(size_t)t * ch] * coef[t];
+
+            if (acc > 32767.0f) acc = 32767.0f;
+            else if (acc < -32768.0f) acc = -32768.0f;
             out[produced * ch + c] = (int16_t)acc;
         }
         r->pos += r->step;

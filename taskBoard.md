@@ -280,6 +280,8 @@ M1 关键路径（当前）：
 - 部署：串口 `rx/rb`（或 TF/U 盘）；**不要**再尝试 NFS/scp，eth0 不可用。
 - 板端运行目录：`/tmp/gapp`，环境变量：
   `LD_LIBRARY_PATH=/tmp/gapp/usr/lib`、`ALSA_CONFIG_PATH=/tmp/gapp/usr/share/alsa/alsa.conf`。
+- 持久版：**`/root/gapp`**（`/root` 可写，2026-11-12 实测）；日常覆盖只传 strip+gzip 的二进制，
+  回滚用 `/root/gapp.bak`，开机后 `/root/gapp/run.sh` 直接跑（`ubuntuArmBuild.md §7.3.1`）。
 - 每次部署记录：`gapp.tgz` 的 SHA256、commit SHA、板端 `md5sum`、运行命令。
 - 离开调试位：杀掉 `gesture_audio`，报“板子空闲”。
 

@@ -19,14 +19,17 @@
 
 #include <stdint.h>
 
-#define RS_TAPS   64          /* 每相位抽头数（偶数） */
-#define RS_PHASES 256         /* 分数相位表分辨率 */
+#define RS_TAPS   32          /* 每相位抽头数（偶数；64 抽头软浮点板实测 ALSA 欠载） */
+#define RS_PHASES 128         /* 分数相位表分辨率 */
 
 typedef struct {
     int    in_channels;
     double step;                          /* 当前步长 */
     double pos;                           /* 当前缓冲内的浮点源位置（帧） */
-    double coeff[RS_PHASES][RS_TAPS];     /* 预计算分数相位系数（已归一化） */
+    /* 系数用 float：板端是软浮点 ABI，double 乘加会走 __aeabi_dmul/dadd，
+     * 44.1k 下 CPU 过重（实测 ALSA underrun）。32 抽头 Blackman-sinc 的
+     * alias_8k_2x 仍有 −64.5dBc，足够满足 −40dBc 验收。 */
+    float  coeff[RS_PHASES][RS_TAPS];     /* 预计算分数相位系数（已归一化） */
 } resampler_t;
 
 void resampler_init(resampler_t *r, int in_channels, double step);

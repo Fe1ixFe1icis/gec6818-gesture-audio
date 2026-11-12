@@ -504,6 +504,14 @@ cd ~/stage && tar czf gapp.tgz .
 ls -lh gapp.tgz
 ```
 
+> **打包前先 `rm -f ~/stage/gapp.tgz`**：如果旧包还在目录里，`tar czf gapp.tgz .` 会把旧包也打进去
+> （本机 3MB 包里就有一个嵌套 `./gapp.tgz`），白占体积。
+>
+> **本板 `/tmp` 是 tmpfs，重启后 `/tmp/gapp` 会被清空。** 首次部署后把 `gapp.tgz` 另存到
+> 持久目录（`/root` 可写时，或 TF 卡），重启后只需：
+> `mkdir -p /tmp/gapp && tar xzf /root/gapp.tgz -C /tmp/gapp`，不用再占串口 10 分钟。
+> 更好的做法是直接在 rootfs 上跑持久版、以后只覆盖变化的二进制，见 **§7.3.1**。
+
 把 `gapp.tgz` 弄到 Windows（VM 共享目录没开时，用宿主机的上传口）：
 
 ```bash
@@ -591,6 +599,98 @@ export ALSA_CONFIG_PATH=/tmp/gapp/usr/share/alsa/alsa.conf
 
 `player.c` 会按 `default → plughw:0,0 → hw:0,0` 回退，日志里的 `ALSA 设备：xxx` 会告诉你实际用的是哪个。
 如果根文件系统可写，也可以把 `usr/lib`、`usr/share/alsa`、`bin` 直接铺到 `/`，就不用两个环境变量。
+
+### 7.3.1 持久化到 rootfs（当前版本 → 持久版的覆盖更新）
+
+`/tmp` 是 tmpfs，重启清空；**持久版放 rootfs**（推荐 `/root/gapp`），重启后仍在。
+下文的「当前版本」= 本次编出的 `build/gesture_audio`，「持久版」= `/root/gapp`
+（含 `bin/`、`usr/lib`、`usr/share`、`audio/`，即 `gapp.tgz` 解开后的样子）。
+
+**先判持久目录能不能写**（✅ 本板 2026-11-12 实测 `/root` 可写，`ROOT_RW=yes`；换板/换镜像必须重测）：
+
+```bash
+mount | head -20                                  # / 是 ext4 还是 squashfs/cramfs
+df -h / /root 2>/dev/null
+touch /root/.wtest && echo ROOT_RW=yes && rm -f /root/.wtest
+```
+
+- 出现 `ROOT_RW=yes`：用 `/root/gapp`（root 家目录，最不容易被系统升级覆盖）；
+- 报 `Read-only file system`：先 `mount -o remount,rw /` 再试；仍失败就退回 TF 卡
+  （`mount /dev/mmcblk1p1 /mnt/sd`，持久目录改 `/mnt/sd/gapp`，下文路径整体替换）。
+
+**① 首次固化（只需一次：把当前 `/tmp/gapp` 变成持久版）**
+
+```bash
+killall gesture_audio 2>/dev/null; sleep 1
+mkdir -p /root/gapp
+cp -a /tmp/gapp/. /root/gapp/          # 含 bin/ usr/lib usr/share audio/
+cd /root/gapp && tar czf /root/gapp.tgz . && sha256sum /root/gapp.tgz
+```
+
+**② 日常覆盖更新（推荐：只换二进制）**
+
+libasound / `alsa.conf` / 素材没变时，串口只传「strip + gzip 过的新程序」：
+`-g` 产物约 1.0 MB，`strip` 后约 0.2 MB，gz 后 < 0.1 MB，ZMODEM 5 KB/s 下约 20 s
+（比整包 1.4 MB 快一个数量级）。
+
+```bash
+# VM / 集成机
+cd ~/gec6818 && bash tools/armbuild.sh
+cp build/gesture_audio /tmp/gesture_audio.new
+arm-linux-strip /tmp/gesture_audio.new        # 无此命令就用 arm-none-linux-gnueabi-strip
+gzip -9 -c /tmp/gesture_audio.new > /tmp/gesture_audio.gz
+sha256sum /tmp/gesture_audio.gz               # 记下，板端解压后比对
+
+# 板端（rx / rb / rz 把 gesture_audio.gz 传到 /tmp）
+killall gesture_audio 2>/dev/null; sleep 1    # 进程在跑会报 Text file busy
+rm -rf /root/gapp.bak && cp -a /root/gapp /root/gapp.bak
+gzip -dc /tmp/gesture_audio.gz > /tmp/gesture_audio.new
+chmod +x /tmp/gesture_audio.new
+cp /tmp/gesture_audio.new /root/gapp/bin/.gesture_audio.new
+mv /root/gapp/bin/.gesture_audio.new /root/gapp/bin/gesture_audio
+```
+
+> 为什么多一步 `cp` 再 `mv`：`/tmp`（tmpfs）→ rootfs 的 `mv` 实际是「复制 + 删源」，
+> 中途断电会留下半个可执行文件；先 `cp` 落到同分区，再 `mv` 就是 `rename`，原子切换。
+> 镜像没有 `killall` 时用 `kill $(pidof gesture_audio)`。
+
+**③ 整包覆盖（`usr/lib`、`alsa.conf`、素材也变了）**
+
+```bash
+# VM 侧：旧包先从打包目录删掉，否则会被打进新包（§7.1）
+cd ~/stage && rm -f gapp.tgz && tar czf gapp.tgz .
+# 板端：新包先落盘（串口传的用 /tmp/gapp.tgz），解到新目录，最后一刻再切换
+cp /mnt/sd/gapp.tgz /root/gapp.tgz.new && mv /root/gapp.tgz.new /root/gapp.tgz
+rm -rf /root/gapp.new && mkdir -p /root/gapp.new && tar xzf /root/gapp.tgz -C /root/gapp.new
+mv /root/gapp /root/gapp.prev && mv /root/gapp.new /root/gapp
+```
+
+**④ 持久版怎么启动（环境变量别每次手敲）**
+
+```bash
+cat > /root/gapp/run.sh <<'EOF'
+#!/bin/sh
+export LD_LIBRARY_PATH=/root/gapp/usr/lib
+export ALSA_CONFIG_PATH=/root/gapp/usr/share/alsa/alsa.conf
+cd /root/gapp
+exec ./bin/gesture_audio "$@"
+EOF
+chmod +x /root/gapp/run.sh
+
+/root/gapp/run.sh --selftest audio/test_44100.wav                # 期望 20 通过 / 0 失败
+/root/gapp/run.sh --sensor sim --log info audio/test_44100.wav   # 出声 + LCD
+```
+
+> 写进 `/etc/profile.d/` 对板端 busybox shell 不一定生效（⚙️ 未实测），wrapper 最稳；
+> 要开机自启再另做 init 脚本，且必须先报备占用时段（`devFlow.md §3`）。
+
+**⑤ 对账与回滚**
+
+- 版本可追溯：`/root/gapp/VERSION` 记 `commit` + 构建时间 + 二进制 sha256，
+  与 GitHub 提交一一对应（`devFlow.md §7` 红线 4）；本次覆盖后在 `testGuide.md` T0 记一笔；
+- 回滚二进制：`cp -a /root/gapp.bak/bin/gesture_audio /root/gapp/bin/`；
+- 回滚整包：`rm -rf /root/gapp && mv /root/gapp.prev /root/gapp`；
+- **镜像重刷会清空 `/root`**：想跨重刷保留，把 `gapp.tgz` 同时留一份在 TF 卡。
 
 ### 7.4 NFS（换板或修好 PHY 后）
 

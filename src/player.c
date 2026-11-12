@@ -329,6 +329,27 @@ static int resample(int frames, double step)
 {
     int produced, consumed;
 
+    /* step==1.0（源 44.1k + 1.0x）直接拷贝：板端是软浮点 ABI，
+     * 64 抽头 sinc 即使“原速”也会把 CPU 吃满、ALSA 欠载；原速没有
+     * 采样率转换需求，完全不需要过重采样器。 */
+    if (fabs(step - 1.0) < 1e-9) {
+        produced = 0;
+        while (produced < frames) {
+            int n;
+            if (s_src_len <= 0) {
+                if (src_refill() <= 0) break;
+                continue;
+            }
+            n = frames - produced;
+            if (n > s_src_len) n = s_src_len;
+            memcpy(s_out + (size_t)produced * s_channels, s_srcbuf,
+                   (size_t)n * s_channels * sizeof(int16_t));
+            consume_src(n);
+            produced += n;
+        }
+        return produced;
+    }
+
     if (step != s_last_step) {
         resampler_set_step(&s_rs, step);
         s_last_step = step;

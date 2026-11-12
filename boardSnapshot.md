@@ -50,6 +50,7 @@
 | TF 卡 | ✅ 待用（`/dev/mmcblk*`，需确认卡槽） |
 | U 盘 | ✅ 待用（`/dev/sd*`） |
 | 串口 Zmodem | 取决于板端是否有 `rz`：⏳ `which rz sz` 待执行 |
+| rootfs `/root` | ✅ **可写**（2026-11-12 实测 `ROOT_RW=yes`）→ 持久版可放 `/root/gapp` |
 
 ## 6. 首版上板运行（2026-11-11 23:58）
 
@@ -64,7 +65,7 @@
 | 自检 | **板端 `--selftest` 20 通过 / 0 失败 / 0 跳过**（2026-11-11 23:4x） |
 | 本地 TCP | `nc`、`telnet` 均在 `/bin`，可做 `127.0.0.1:8888` 回环测试（T4/T6 不再完全阻塞） |
 | demo 播放 | `demo.wav` 48k/2ch/93.8s 解析正常；`default` 因配置树不在 `/usr/share/alsa` 失败，`plughw:0,0` 出声；sim 每 3s 切歌/变速/暂停，整首会被打断 |
-| `/tmp` | tmpfs 404MB（已用 18.4MB，可用 385.5MB），放 17MB demo 没问题 |
+| `/tmp` | tmpfs 404MB（已用 18.4MB，可用 385.5MB），放 17MB demo 没问题；**重启即清空，`/tmp/gapp` 会消失** |
 | 串口传输 | XMODEM 实测约 **5 KB/s**；17.1MB `demo.wav` 实测 **53 分钟**；30s 单声道约 5–8 分钟 |
 | 待补 | D1–D3 板端回归、T3.3/T3.4 的 EOF 实测 |
 
@@ -85,3 +86,17 @@ ls /dev/mmcblk* /dev/sd*
 ```
 
 > 换板、换镜像、换网线后，§3 的网络结论要重测，不要照抄。
+
+## 8. rootfs 持久化（2026-11-12 22:0x）
+
+| 项 | 实测/命令 | 结果 | 判定 |
+|---|---|---|---|
+| `/root` 可写 | `touch /root/.wtest && echo ROOT_RW=yes` | `ROOT_RW=yes` | ✅ 有写权限（非只读 rootfs） |
+| `/tmp/gapp` | 运行目录 | 存在 | ✅ tmpfs，重启丢失 |
+| 持久版 `/root/gapp` | 本次固化 | ⏳ 待回填 `ls -l /root/gapp/bin` | 复制流程见 `ubuntuArmBuild.md §7.3.1` |
+| `/root/gapp.tgz` 快照 | `sha256sum` / `ls -lh` | ⏳ 待回填 | 回滚与重刷用 |
+| rootfs 剩余空间 | `df -h /root` | ⏳ 待回填 | 决定 17 MB 素材是否留 `/root` |
+
+**结论**：本板 rootfs 可写，`/tmp/gapp` 可直接固化为 `/root/gapp`，重启后不必再占串口重传；
+日常覆盖只需传 strip+gzip 的二进制（`ubuntuArmBuild.md §7.3.1`）。
+⚠️ 重刷镜像会清空 `/root`，跨重刷要另留一份在 TF 卡；权威版本仍是 git 提交。
