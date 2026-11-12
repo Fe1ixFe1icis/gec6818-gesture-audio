@@ -311,6 +311,12 @@ python tools/netctl.py <板子IP> "ECHO on 250 40" "EQ mid 6" "EQ low -6" STATUS
 预期：回声有明显"第二次响"（约 250ms 后）；中频提升后双音更亮，低频衰减后低沉；
 `echo=on,250,40`、`eq=-6,6,0`。
 
+> **M5Q-03 主机侧已量化（2026-11-12）**：回声延迟线改为预分配 800ms、改延迟走 20ms
+> 交叉淡化（不再 realloc/清零）、反馈路径加 4kHz 一阶低通、wet/dry 默认 0.70/1.00。
+> `make audio_quality` 四项 PASS：`echo_damping` −6.3 dB/遍、`echo_delay_switch`
+> −25.8 dBFS、`echo_self_osc`（fb=90）末段衰减且零硬削、`echo_wet_mix` 0/14000。
+> **板端听感与改延迟复测仍需按本节在 COM3 上执行并补记录。**
+
 ### T4 TCP 协议
 
 #### T4.1 指令与回执（✅ 本机通过）

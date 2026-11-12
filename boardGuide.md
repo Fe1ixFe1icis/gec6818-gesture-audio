@@ -145,19 +145,19 @@ bootargs=root=/dev/mmcblk0p2 rw rootfstype=ext4 lcd=vs070cxn tp=gslx680-linux
 
 Windows：**SecureCRT**（本机在用，会话名 `Serial-COM6`）/ MobaXterm / PuTTY
 
-#### 2.2.1 本机实测参数（2026-11-11 ✅）
+#### 2.2.1 本机实测参数（2026-11-11 ✅；2026-11-12 端口重枚举为 COM3）
 
 | 项 | 实测值 | 怎么查到的 |
 |---|---|---|
 | 转接芯片 | **USB-SERIAL CH340**（`VID_1A86&PID_7523`，驱动服务 `CH341SER_A64`，设备状态 OK，`ConfigManagerErrorCode=0`） | 设备管理器 / `Get-CimInstance Win32_PnPEntity` |
-| PC 端口号 | **COM4**（2026-11-11 当前） | `[System.IO.Ports.SerialPort]::GetPortNames()` |
-| 终端软件 | **SecureCRT**，会话 `Serial-COM4`，状态栏显示 `Serial, COM4, 115200`，终端类型 VT100 | 窗口标题与状态栏 |
+| PC 端口号 | **COM3**（2026-11-12 当前；2026-11-11 为 COM4。端口号随插拔/USB 口变化，以当场查询为准） | `[System.IO.Ports.SerialPort]::GetPortNames()` |
+| 终端软件 | **SecureCRT**，会话 `Serial-COM3`，状态栏显示 `Serial, COM3, 115200`，终端类型 VT100 | 窗口标题与状态栏 |
 | 端口参数 | **115200 · 8 数据位 · 1 停止位 · 无校验 · 无流控** | 同上 |
 | 板端 | UART0 = `/dev/ttySAC0`。底板自带 USB 转串口时一根 USB 线即可；用外置 USB-TTL 模块时接 **GND / TX / RX 三根，TX 与 RX 交叉** | 底板丝印 + 内核 console |
 
 **端口号是机器侧属性，不是板子的属性**：换 USB 口、换电脑、换插拔顺序都会重新分配。别照抄 COM6，先查再连。
 
-SecureCRT 配置位置：`Options → Session Options → Connection → Serial`，Port = `COM4`，Baud rate = `115200`，Data bits = `8`，Parity = `None`，Stop bits = `1`；`Flow Control` 里 **RTS/CTS 与 XON/XOFF 全部取消勾选**（开了就一片乱码，这是最高频的错）。
+SecureCRT 配置位置：`Options → Session Options → Connection → Serial`，Port = `COM3`，Baud rate = `115200`，Data bits = `8`，Parity = `None`，Stop bits = `1`；`Flow Control` 里 **RTS/CTS 与 XON/XOFF 全部取消勾选**（开了就一片乱码，这是最高频的错）。
 
 > **中文日志必须用 UTF-8 显示**。程序的日志是 UTF-8；SecureCRT 默认常是 GBK，
 > 会把 `结果：20 通过` 显示成 `缁撴灉锛0 ...`（`2` 被 GBK 双字节吞掉）。

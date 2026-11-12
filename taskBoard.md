@@ -175,7 +175,15 @@
 >   注：`alias_8k_2x` 首版 −33.4 dBc 是 Hann 窗泄漏（输出 16kHz 非整 bin），非重采样缺陷——把测试源频率对齐到输出整 bin 后测到真实杂散 −64.5 dBc。
 > - **M5Q-04 已完成 ✅** —— `src/effect.c` 新增 `soft_limit()`（0.9FS 软拐点 + 渐近饱和，线性区零失真），替换回声输出与 EQ 输出的硬 clamp。`clip_fullscale` 58782/88200 → 0/88200 样本硬削波；`thd_1k` 0.0083% 不变，`selftest` 19 过 0 败。
 > - **M5Q-02 已完成 ✅** —— `src/effect.c` 新增增益斜坡：`effect_set_cfg` 只更新目标增益并算每采样步长，`effect_process` 每采样推进 `s_eq_cur_gain` 并按当前增益重算 biquad 系数，`eq_recalc` 切系数**保留 z1/z2**（不再清零）；EQ 关闭（旁通）时把残余斜坡直接落到目标并清状态。`tools/audio_quality.c` 新增 `eq_click_switch` 用例（DC 输入下低架 0→+12dB 切换，测输出一阶差分峰值）。改后报告：`eq_click_switch` 差分峰值 16（−66.2 dBFS，阈值 < −60 dBFS）PASS；全 8 项 PASS，`thd_1k`/`clip_fullscale`/`echo_decay` 不受影响，`selftest` 19 过 0 败 1 跳。
-> - **待办**：M5Q-03（回声阻尼/干湿/延迟切换），为后续项。
+> - **M5Q-03 已完成 ✅（主机侧）** —— `src/effect.c` 回声引擎重写：
+>   ① 延迟线按 `ECHO_DELAY_MAX_MS`（800ms，约 138KiB 立体声）**一次预分配**，改延迟只改读写指针，不再 `realloc`/`memset`；
+>   ② 改延迟用 **20ms 新旧抽头交叉淡化**（`s_echo_prev_f`/`s_echo_xf_len`），相位跳变不再“咔/爆”；
+>   ③ 反馈路径加**一阶低通 4kHz**（`ECHO_DAMP_HZ`，`a≈0.435`），回声一次比一次暗，去金属/硬拖尾；
+>   ④ wet/dry 可配：内部头 `src/effect_ext.h` + `effect_echo_set_mix()`（默认 0.70/1.00，**不改 `include/effect.h` 冻结结构**）；
+>   ⑤ echo 从关到开时才清延迟线（防旧音频回放），反馈写入也走 `soft_limit()`。
+>   新增 4 个离线用例：`echo_damping` **−6.3 dB/遍**（1k ×0.58、8k ×0.28）PASS；`echo_delay_switch` 差分 **1689（−25.8 dBFS）**、稳态基线 1776 PASS；`echo_self_osc` fb=90、5s：第 2 次回声 8191 → 末 100ms 峰值 0、硬削波 0 PASS；`echo_wet_mix` wet=0 回声 0 / wet=0.7 回声 14000 PASS。
+>   全 12 项 PASS；`selftest` 19 过 0 败 1 跳；`tools/player_regress.py` 0 失败。**板端听感（M5Q-08）待上板**。
+> - **待办**：M5Q-08（真机 A/B 听感验收，需 COM3 上板）；P1 的 M5Q-05/06/09 随后。
 
 ---
 
@@ -241,15 +249,15 @@ M1 关键路径（当前）：
 | R14 | 串口传大文件慢 | 🟡 | `prep_demo_wav.py` 裁 30s；优先 `rb`/`rz` |
 | R15 | D1–D3 仅主机验证 | 🟡 | 板端用 `nc` 或 LCD 复测 |
 | R16 | 接口冻结未决 | 🟡 | M1-09 一次拍板 |
-| R17 | 音效“粗糙”（混叠/削波/咔哒/金属回声） | 🟡 已暴露 | demo 试听触发；按 §3.4 P0 做 M5Q-01/02/03/04/07，M4 前过 M5Q-08 |
+| R17 | 音效“粗糙”（混叠/削波/咔哒/金属回声） | 🟡 已缓解 | 混叠/削波/EQ 咔哒/回声阻尼已由 M5Q-01/02/03/04 量化修复；**M5Q-08 真机听感验收未做**，M4 演示前必须过 |
 | R11 | 进度压缩 | 🟡 | M1 已过大半；M2 选型是下一个硬截止 |
 
 ---
 
 ## 8. 协作与执行机制（本机）
 
-- 板子：COM4，SecureCRT `Serial-COM4`，115200 8N1，流控全关；**字符编码设为 UTF-8**（中文日志乱码时先改）。
-- AI 不直接占用 COM4：人类敲命令，AI 读回显/日志；串口同一时间只许一人。
+- 板子：**COM3**（2026-11-12 当前；11-11 为 COM4，端口随插拔变化），SecureCRT `Serial-COM3`，115200 8N1，流控全关；**字符编码设为 UTF-8**（中文日志乱码时先改）。
+- AI 不直接占用 COM3：人类敲命令，AI 读回显/日志；串口同一时间只许一人。
 - 部署：串口 `rx/rb`（或 TF/U 盘）；**不要**再尝试 NFS/scp，eth0 不可用。
 - 板端运行目录：`/tmp/gapp`，环境变量：
   `LD_LIBRARY_PATH=/tmp/gapp/usr/lib`、`ALSA_CONFIG_PATH=/tmp/gapp/usr/share/alsa/alsa.conf`。
