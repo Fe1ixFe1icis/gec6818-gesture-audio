@@ -99,6 +99,10 @@ const char *server_format_status(char *buf, int len)
 
     if (!buf || len <= 0) return "";
     status_get(&st);
+    /* STATUS 是协议的只读快照：参数直接取当前值，不依赖播放线程刷新。
+     * 播放线程只在“有帧”时搬运 st->params；EOF/STOPPED/ERROR 时若不补这一行，
+     * 客户端会看到切歌前甚至开机时的旧音量/速度/回声（M6-02 抓到）。 */
+    params_get(&st.params);
     st.clients = server_client_count();      /* 在线数只有本模块知道，就地补正 */
     snprintf(buf, (size_t)len,
              "STATUS vol=%d speed=%.2f state=%s track=%d/%d pos=%d len=%d "
