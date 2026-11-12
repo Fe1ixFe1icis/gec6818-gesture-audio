@@ -64,6 +64,9 @@
 #define LIM_CLICK_DBFS     -60.0   /* EQ 切换 click 峰值上限 dBFS（M5Q-02） */
 #define LIM_ECHO_DAMP_DB   -3.0    /* 8k 每遍额外衰减下限 dB（M5Q-03 反馈阻尼） */
 #define LIM_ECHO_SWITCH_DBFS -15.0 /* 改延迟时一阶差分峰值上限 dBFS（M5Q-03） */
+#define LIM_HPF_DB         -12.0   /* 10Hz 处衰减下限 dB（M5Q-05） */
+#define LIM_DC_LSB         1       /* DC 阻断后残留上限（LSB，M5Q-05） */
+#define LIM_PRESET_RATIO   1.5     /* 预设切换差分峰值 / 稳态基线上限（M5Q-06） */
 
 static int g_fails = 0;
 
@@ -324,6 +327,43 @@ static int peak_in(const int16_t *buf, long lo, long hi)
         if (a > mx) mx = a;
     }
     return mx;
+}
+
+/* 左声道 [lo, hi) 的 RMS（归一化到 ±1.0） */
+static double rms_left(const int16_t *buf, long lo, long hi)
+{
+    long i, n = 0;
+    double s = 0.0;
+
+    if (lo < 0) lo = 0;
+    for (i = lo; i < hi; i++) {
+        double v = (double)buf[i * CH] / 32768.0;
+        s += v * v;
+        n++;
+    }
+    return n ? sqrt(s / (double)n) : 0.0;
+}
+
+/* 生成 2s 正弦 → 设置 EQ 预设/增益 → 处理后返回稳态增益（dB，相对输入）。
+ * 跳过前 0.5s，避开预设交叉淡化与滤波器建立过程。 */
+static double eq_gain_db(double freq, int low, int mid, int high, int preset)
+{
+    const long frames = RATE * 2;
+    const long skip = RATE / 2;
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    double rms_in, rms_out, db;
+
+    gen_sine(buf, frames, freq, RATE, 8000.0);
+    effect_eq_set_preset(preset);                /* 先选频点（内部接口） */
+    effect_reset();                              /* 清状态，避免上一次预设残留 */
+    effect_eq(low, mid, high);
+    effect_process(buf, (int)frames);
+
+    rms_in  = 8000.0 / 32768.0 / sqrt(2.0);
+    rms_out = rms_left(buf, skip, frames);
+    db = (rms_out > 0.0) ? 20.0 * log10(rms_out / rms_in) : -999.0;
+    free(buf);
+    return db;
 }
 
 /* ================= 测试用例 ================= */
@@ -751,6 +791,153 @@ static void test_echo_mix(const char *outdir)
     free(buf);
 }
 
+/* M5Q-05：10Hz 亚声衰减。用高架 -12dB 把效果链激活（它在 10Hz 近似 0dB），
+ * 避免低架增益污染低频测量。 */
+static void test_hpf(const char *outdir)
+{
+    const long frames = RATE * 3;
+    const long skip   = RATE;                    /* 1s 后进入稳态 */
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    double db10, db1k;
+    char detail[128];
+
+    (void)outdir;
+    gen_sine(buf, frames, 10.0, RATE, 8000.0);
+    effect_eq_set_preset(EFFECT_EQ_PRESET_STANDARD);
+    effect_reset();
+    effect_eq(0, 0, -12);                        /* 激活链路；高架在 10Hz≈0dB */
+    effect_process(buf, (int)frames);
+    db10 = 20.0 * log10(rms_left(buf, skip, frames)
+                        / (8000.0 / 32768.0 / sqrt(2.0)));
+
+    gen_sine(buf, frames, 1000.0, RATE, 8000.0);
+    effect_reset();
+    effect_eq(0, 0, -12);
+    effect_process(buf, (int)frames);
+    db1k = 20.0 * log10(rms_left(buf, skip, frames)
+                        / (8000.0 / 32768.0 / sqrt(2.0)));
+
+    snprintf(detail, sizeof detail, "10Hz %.1f dB，1kHz %+.2f dB", db10, db1k);
+    report("hpf_10hz", db10 < LIM_HPF_DB && fabs(db1k) < 0.5,
+           "10Hz 衰减", "<-12 dB", detail);
+    free(buf);
+}
+
+/* M5Q-05：DC 阻断。DC 4000 + 三段 +12dB（最坏情况），稳态残留应 <= 1 LSB。 */
+static void test_dc_block(const char *outdir)
+{
+    const long frames = RATE * 2;
+    const long skip   = RATE;                    /* 测最后 1s */
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    long i;
+    int mx = 0;
+    char detail[96];
+
+    (void)outdir;
+    for (i = 0; i < frames * CH; i++) buf[i] = 4000;
+    effect_eq_set_preset(EFFECT_EQ_PRESET_STANDARD);
+    effect_reset();
+    effect_eq(12, 12, 12);
+    effect_process(buf, (int)frames);
+
+    for (i = skip * CH; i < frames * CH; i++) {
+        int a = buf[i] < 0 ? -buf[i] : buf[i];
+        if (a > mx) mx = a;
+    }
+    snprintf(detail, sizeof detail, "稳态最大残留 %d LSB", mx);
+    report("dc_offset", mx <= LIM_DC_LSB, "DC 残留", "<=1 LSB", detail);
+    free(buf);
+}
+
+/* M5Q-06：三段可听辨且互不重叠。standard 频点 120Hz / 1k Q0.7 / 6kHz，
+ * 各段 +12dB 时：本段显著提升，其余两段测量点保持在 ±1.5dB 内。 */
+static void test_eq_bands(const char *outdir)
+{
+    double low60  = eq_gain_db(60.0,   12, 0, 0, EFFECT_EQ_PRESET_STANDARD);
+    double low1k  = eq_gain_db(1000.0, 12, 0, 0, EFFECT_EQ_PRESET_STANDARD);
+    double mid1k  = eq_gain_db(1000.0, 0, 12, 0, EFFECT_EQ_PRESET_STANDARD);
+    double mid60  = eq_gain_db(60.0,   0, 12, 0, EFFECT_EQ_PRESET_STANDARD);
+    double mid10k = eq_gain_db(10000.0,0, 12, 0, EFFECT_EQ_PRESET_STANDARD);
+    double high10k= eq_gain_db(10000.0,0, 0, 12, EFFECT_EQ_PRESET_STANDARD);
+    double high1k = eq_gain_db(1000.0, 0, 0, 12, EFFECT_EQ_PRESET_STANDARD);
+    char detail[160];
+
+    (void)outdir;
+    snprintf(detail, sizeof detail, "60Hz %+.1f / 1k %+.2f dB", low60, low1k);
+    report("eq_low_band", low60 > 7.0 && fabs(low1k) < 1.5,
+           "低架 +12dB", "本段>7dB 其余<1.5dB", detail);
+
+    snprintf(detail, sizeof detail, "1k %+.1f / 60Hz %+.2f / 10k %+.2f dB",
+             mid1k, mid60, mid10k);
+    report("eq_mid_band", mid1k > 9.0 && fabs(mid60) < 1.5 && fabs(mid10k) < 1.5,
+           "峰 +12dB", "本段>9dB 其余<1.5dB", detail);
+
+    snprintf(detail, sizeof detail, "10k %+.1f / 1k %+.2f dB", high10k, high1k);
+    report("eq_high_band", high10k > 8.0 && fabs(high1k) < 1.5,
+           "高架 +12dB", "本段>8dB 其余<1.5dB", detail);
+}
+
+/* M5Q-06：内部预设有效且切换无爆音。standard→vocal，1kHz 正弦、三段 +6dB；
+ * 交叉淡化期间一阶差分峰值不应超过稳态基线的 1.5 倍。 */
+static void test_eq_preset_switch(const char *outdir)
+{
+    const long frames = RATE * 2;
+    const long half   = RATE;
+    const long win    = RATE / 10;               /* 100ms */
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    long i;
+    int base = 0, sw = 0;
+    int base2 = 0, sw2 = 0;
+    double std80, voc80, std8k, demo8k, voicing;
+    int n = effect_eq_preset_count();
+    char detail[220];
+
+    (void)outdir;
+    std80  = eq_gain_db(80.0, 12, 0, 0, EFFECT_EQ_PRESET_STANDARD);
+    voc80  = eq_gain_db(80.0, 12, 0, 0, EFFECT_EQ_PRESET_VOCAL);
+    std8k  = eq_gain_db(8000.0, 0, 0, 12, EFFECT_EQ_PRESET_STANDARD);
+    demo8k = eq_gain_db(8000.0, 0, 0, 12, EFFECT_EQ_PRESET_DEMO);
+    voicing = fabs(std80 - voc80);
+    if (fabs(std8k - demo8k) > voicing) voicing = fabs(std8k - demo8k);
+
+    gen_sine(buf, frames, 80.0, RATE, 8000.0);
+    effect_eq_set_preset(EFFECT_EQ_PRESET_STANDARD);
+    effect_reset();
+    effect_eq(12, 0, 0);
+    effect_process(buf, (int)half);
+    effect_eq_set_preset(EFFECT_EQ_PRESET_VOCAL);
+    effect_process(buf + half * CH, (int)(frames - half));
+
+    for (i = half - win; i < half; i++) {
+        int d = buf[i * CH] - buf[(i - 1) * CH];
+        int d2 = buf[i * CH] - 2 * buf[(i - 1) * CH] + buf[(i - 2) * CH];
+        if (d < 0) d = -d;
+        if (d2 < 0) d2 = -d2;
+        if (d > base) base = d;
+        if (d2 > base2) base2 = d2;
+    }
+    for (i = half; i < half + win; i++) {
+        int d = buf[i * CH] - buf[(i - 1) * CH];
+        int d2 = buf[i * CH] - 2 * buf[(i - 1) * CH] + buf[(i - 2) * CH];
+        if (d < 0) d = -d;
+        if (d2 < 0) d2 = -d2;
+        if (d > sw) sw = d;
+        if (d2 > sw2) sw2 = d2;
+    }
+
+    snprintf(detail, sizeof detail,
+             "预设 %d 套（%s/%s/%s），80Hz 差异 %.1f dB，8k 差异 %.1f dB，"
+             "切换差分 %d/基线 %d，二阶差分 %d/基线 %d",
+             n, effect_eq_preset_name(0), effect_eq_preset_name(1),
+             effect_eq_preset_name(2), fabs(std80 - voc80),
+             fabs(std8k - demo8k), sw, base, sw2, base2);
+    report("eq_preset_switch",
+           n == 3 && voicing > 1.0 && base > 0 &&
+           sw < (int)(base * LIM_PRESET_RATIO) && sw2 < base2 * 4 + 4,
+           "预设切换无爆音", "一阶<1.5× 二阶<4×基线", detail);
+    free(buf);
+}
+
 /* ================= main ================= */
 int main(int argc, char **argv)
 {
@@ -783,6 +970,10 @@ int main(int argc, char **argv)
     test_thd(outdir);
     test_eq_click(outdir);
     test_clip(outdir);
+    test_hpf(outdir);
+    test_dc_block(outdir);
+    test_eq_bands(outdir);
+    test_eq_preset_switch(outdir);
     test_echo_decay(outdir);
     test_echo_damping(outdir);
     test_echo_delay_switch(outdir);
