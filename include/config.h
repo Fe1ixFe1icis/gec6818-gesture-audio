@@ -10,7 +10,7 @@
 
 /* ---------------- 版本与标识 ---------------- */
 #define APP_NAME        "gesture_audio"
-#define APP_VERSION     "0.1.0-m1"      /* M1 基础框架 */
+#define APP_VERSION     "0.2.0"         /* v0.2.0 初鸣：M1 框架 + M5Q 音质链 + M6 主机侧 */
 
 /* ---------------- 音频（见 boardGuide.md §3.3） ---------------- */
 #define AUDIO_RATE_HZ          44100    /* 板端原生，避免软件转换 */

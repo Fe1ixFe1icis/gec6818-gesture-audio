@@ -352,7 +352,7 @@ python tools/netctl.py <板子IP> "HELP" "VOL 70" "VOL 0" "VOL 100" \
 实测（节选，✅）：
 
 ```
-[欢迎] OK gesture_audio 0.1.0-m1 已连接，输入 HELP 查看指令
+[欢迎] OK gesture_audio 0.2.0 已连接，输入 HELP 查看指令
 [OK  ] VOL 70        ->  OK VOL 70
 [ERR ] SPEED 2.5     ->  ERR SPEED 超出 0.5..2.0
 [ERR ] EQ mid 99     ->  ERR EQ 增益超出 -12..12 dB
