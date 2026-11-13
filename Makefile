@@ -29,6 +29,7 @@ CFLAGS  := -std=gnu99 -O2 -g -Wall -Wextra -Wno-unused-parameter
 CFLAGS  += -Iinclude -DBOARD=$(BOARD) -D_GNU_SOURCE -pthread
 LDFLAGS := -pthread
 LDLIBS  := -lm
+AQLDLIBS := -lm       # 离线音质工具（audio_quality）的链接库
 
 # ALSA 头文件/库的位置。默认走交叉工具链的 sysroot（最省事）；
 # 若工具链 sysroot 缺 ALSA 开发包，可在命令行覆盖，把板端库和头文件指进来：
@@ -49,6 +50,7 @@ ifeq ($(OS),Windows_NT)
   SHELL  := sh
   HOSTCC := gcc
   LDLIBS += -lws2_32
+  AQLDLIBS += -lws2_32
 endif
 
 MKDIR := mkdir -p $(BUILD)
@@ -70,6 +72,14 @@ $(TARGET): $(OBJS) | $(BUILD)
 tools: | $(BUILD)
 	$(HOSTCC) -O2 -o $(BUILD)/gen_wav tools/gen_wav.c -lm
 	@echo "== tool: $(BUILD)/gen_wav =="
+
+# 离线音质测试工具（M5Q-07，主机侧，链接真实 src/effect.c + src/resample.c + src/log.c）
+audio_quality: | $(BUILD)
+	$(HOSTCC) -std=gnu99 -O2 -Wall -Wextra -Wno-unused-parameter \
+	  -Iinclude -Isrc -DBOARD=0 -D_GNU_SOURCE -pthread \
+	  tools/audio_quality.c src/effect.c src/resample.c src/pitch.c src/log.c \
+	  -o $(BUILD)/audio_quality $(AQLDLIBS)
+	@echo "== tool: $(BUILD)/audio_quality =="
 
 selftest: $(TARGET)
 	$(TARGET) --selftest
@@ -98,4 +108,4 @@ clean:
 
 -include $(wildcard $(OBJS:.o=.d))
 
-.PHONY: all tools selftest arm verify clean
+.PHONY: all tools audio_quality selftest arm verify clean

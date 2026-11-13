@@ -4,9 +4,13 @@
 
 隔空手势控制音乐播放：音量 / 变速 / 切歌 / 音效，LCD 实时反馈，PC 端 TCP 远程控制。
 
-**当前进度：M1 首版基线（v0.1.0-m1）** —— 接口、构建、日志、并发仲裁、四模块骨架、主机模拟后端、板端测试文档齐备；
-D1/D2/D3（EOF 后切歌停摆、PAUSE 不上报、ERROR 不上报）已修复并通过主机回归 20/20；
-传感器真机、LCD 中文字库、MP3 解码按里程碑推进。
+**当前进度：v0.2.0「初鸣」（First Voice）· 2026-11-13 · 首个进入 main 的可演示版本**
+
+- **M1 框架**：接口（12 头）、构建（`BOARD=0/1` 双配置）、日志、并发仲裁、四模块骨架、主机模拟后端、板端测试文档齐备；D1/D2/D3（EOF 后切歌停摆、PAUSE 不上报、ERROR 不上报）已修复。
+- **M5Q 音质链**：抗混叠重采样（窗口 sinc）、软限幅、EQ 30ms 平滑 + 120Hz/1k/6k 三频点 + 三套预设、回声重写（预分配 / 20ms 交叉淡化 / 4kHz 阻尼）、21Hz 高通、变调不变速（±12 半音，默认旁通）——离线 **19/19 项指标通过**。
+- **M6 主机侧**：Tkinter PC 客户端（GUI + CLI，自动重连）+ 协议矩阵 **60/60**。
+- **板端**：软浮点 ABI（glibc 2.23）真机出声、30s underrun 0、800×480 framebuffer、自检 20/20；板端无 libasound，需随包带 `libasound.so.2` + `/usr/share/alsa`。
+- 发布说明与升级/回滚步骤见 [`RELEASE-v0.2.0.md`](RELEASE-v0.2.0.md)；未完成：M5Q-08 听感、M6-03/04、M2 传感器、M4 中文字库。
 
 ## 文档索引
 
@@ -18,6 +22,7 @@ D1/D2/D3（EOF 后切歌停摆、PAUSE 不上报、ERROR 不上报）已修复�
 | `boardSnapshot.md` | **本板实测快照**：ABI（软浮点/glibc 2.23）、fb/ALSA 设备、eth0 PHY 不可用、部署通道结论 |
 | `sensorSelection.md` | **M2 传感器选型记录**：PAJ7620U2 对比/映射/接线/验收/采购，测距后置 |
 | `ubuntuArmBuild.md` | **导入 Ubuntu 做 ARM 交叉编译的实施方案**：打包/传输、工具链与 ALSA 头、`make verify`、NFS 上板、T0–T3 首跑、故障对照 |
+| `RELEASE-v0.2.0.md` | **v0.2.0「初鸣」发布说明**：版本范围、量化指标、已验证/未验证、部署与回滚 |
 | `devFlow.md` | 开发流程与纪律：分支模型、提交规范、板子占用、NFS 同步、红线 |
 | `gitGuide.md` | **Git 操作指南**：初始化、首次提交、分支、保护规则、日常循环、故障回滚 |
 | `AGENT.md` | AI 协作规范（铁律：AI 不代执行任何 git 操作；操作分级与留痕要求） |
@@ -39,18 +44,24 @@ src/              板端源码
   ctrl.c          参数/队列/状态（三把独立锁）
   sensor.c        手势与测距（sim 后端可用；i2c 为 M2 占位）
   player.c        WAV 读取 → 变速重采样 → 效果链 → 音量 → ALSA/空 sink
-  effect.c        回声（延迟线）+ 三段 EQ（biquad）
+  resample.c      抗混叠重采样（窗口 sinc，M5Q-01；player 与离线工具共用）
+  effect.c        回声（预分配延迟线 + 反馈阻尼 + 改延迟交叉淡化）+ 21Hz 高通 + 三段 EQ（biquad，含预设）
   display.c       LCD 800×480 双缓冲 + 5×7 点阵字库；主机侧可导 BMP
   server.c        TCP 服务器：协议解析、状态周期广播
   selftest.c      内置 20 项自检（不依赖声卡/LCD/传感器）
 client/           PC 客户端（M6）
+  gesture_client.py  Tkinter GUI + CLI：全指令、500ms 状态、断线自动重连
+  README.md          客户端用法与心跳/重连说明
 tools/
   gen_wav.c       测试素材生成器（1s 双音 + 1s 静音循环）
   netctl.py       命令行 TCP 客户端（现场测试用）
+  protocol_matrix.py    M6-02 协议矩阵/4 连接/500ms 推送/重连（主机回环一键跑）
+  client_link_test.py   M6-01 客户端心跳/重连回归（Python 假服务器）
   armbuild.sh     Ubuntu 侧一键交叉编译 + ABI 校验（BOARD=1）
   pack_for_ubuntu.ps1  Windows 侧打包成可导入 Ubuntu 的源码 tar.gz
   player_regress.py    主机侧 D1/D2/D3 状态机回归（自带 WAV 合成）
   prep_demo_wav.py     大 WAV 裁剪/降混/重采样（串口部署前压缩体积）
+  audio_quality.c      离线音质测试工具（M5Q-07：THD+N/混叠/削波/EQ 三频与预设/DC 阻断/回声，主机一键报告）
   make_serial_upload.ps1  无 rz/rb 时生成 base64 串口上传脚本
   i2c_probe.c     单地址 I2C 探测（M2 确认 0x73，避免全总线盲扫）
 ```
@@ -86,7 +97,7 @@ bash tools/armbuild.sh
 > ⚠️ **工具链前缀必须与板端 loader 一致**。本板实测是 `/lib/ld-linux.so.3`
 > （软浮点，glibc 2.23），对应 `arm-linux-gcc`（`arm-none-linux-gnueabi`）；
 > 用 `gnueabihf` 编出的程序会要求 `/lib/ld-linux-armhf.so.3`，在本板报
-> `No such file or directory`。详见 `boardGuide.md §2.5`。
+> `No such file or directory`。详见 `boardGuide.md §2.（`。
 
 ## 运行
 
@@ -101,11 +112,19 @@ bash tools/armbuild.sh
 ./build/gesture_audio --dump-bmp /tmp/ui.bmp
 
 # 远程控制
-python3 tools/netctl.py <板子IP> 8888 "VOL 70" "SPEED 1.5" "STATUS"
+python3 tools/netctl.py <板子IP> 8888 "VOL 70" "SPEED 1.（" "STATUS"
+
+# PC 客户端（GUI；Windows 无 python 别名时用 py -3.11）
+py -3.11 client/gesture_client.py --host <板子IP> --port 8888
+py -3.11 client/gesture_client.py --cli --host <板子IP> --cmd "STATUS" --cmd "VOL 70"
+
+# EQ 预设 A/B（内部预设，不发协议）
+./build/gesture_audio --eq-preset vocal --sensor sim audio/test_44100.wav
 ```
 
 常用选项：`--port` / `--sensor sim|i2c` / `--no-display` / `--run <秒>` /
-`--log error|warn|info|debug` / `--selftest` / `--dump-bmp`，`--help` 看全部。
+`--eq-preset standard|vocal|demo` / `--log error|warn|info|debug` /
+`--selftest` / `--dump-bmp`，`--help` 看全部。
 
 ## 架构要点（读代码前先看这三条）
 

@@ -311,6 +311,34 @@ python tools/netctl.py <板子IP> "ECHO on 250 40" "EQ mid 6" "EQ low -6" STATUS
 预期：回声有明显"第二次响"（约 250ms 后）；中频提升后双音更亮，低频衰减后低沉；
 `echo=on,250,40`、`eq=-6,6,0`。
 
+> **M5Q-03 主机侧已量化（2026-11-12）**：回声延迟线改为预分配 800ms、改延迟走 20ms
+> 交叉淡化（不再 realloc/清零）、反馈路径加 4kHz 一阶低通、wet/dry 默认 0.70/1.00。
+> `make audio_quality` 四项 PASS：`echo_damping` −6.3 dB/遍、`echo_delay_switch`
+> −25.8 dBFS、`echo_self_osc`（fb=90）末段衰减且零硬削、`echo_wet_mix` 0/14000。
+> **板端听感与改延迟复测仍需按本节在 COM3 上执行并补记录。**
+
+> **M5Q-05/06 主机侧已量化（2026-11-12）**：新增 21Hz 二阶高通（10Hz −13.1dB、
+> 1kHz −0.01dB；DC 4000 + 三段 +12dB 残留 0 LSB）；EQ 频点改为
+> **低架 120Hz / 峰 1kHz Q0.7 / 高架 6kHz**，另有三套内部预设。离线结果：
+> 低架 +12dB 时 60Hz +11.0dB、1k +0.00dB；峰 +12dB 时 1k +11.9dB、60Hz +0.05、
+> 10k +0.22；高架 +12dB 时 10k +10.9dB、1k +0.01；预设切换二阶差分 7/7
+> （无交叉淡化对照 99/7）。板端 A/B 用：
+>
+> ```bash
+> ./gesture_audio --eq-preset standard --sensor sim audio/test_44100.wav
+> ./gesture_audio --eq-preset vocal    --sensor sim audio/test_44100.wav
+> ./gesture_audio --eq-preset demo     --sensor sim audio/test_44100.wav
+> ```
+>
+> 听感重点：120Hz 低架不再“轰头”、6kHz 高架不刺耳、三套预设切换无“咔/爆”。
+
+> **M5Q-10 变调不变速（内部可选，非协议，2026-11-13）**：时域颗粒移调（双读头 +
+> 互补三角交叉淡化），`ratio = 2^(半音/12)`，输出时长 1:1。默认 0 = 旁通（效果全关仍逐字节
+> bypass），CLI `--pitch <半音>`（±12）开启；**不进协议、不动冻结接口**。离线量化
+> `make audio_quality` 的 `pitch_shift` 三组（+12/−12/+7 半音）最大偏差 **16.1 音分**、
+> 削波 0，PASS（阈值 < 20 音分）。已知代价：granular 算法固有轻微 warble（时域侧带），
+> 故 v1 默认关，仅演示/彩排可选开；取舍见 `boardGuide.md §3.3`。
+
 ### T4 TCP 协议
 
 #### T4.1 指令与回执（✅ 本机通过）
@@ -324,7 +352,7 @@ python tools/netctl.py <板子IP> "HELP" "VOL 70" "VOL 0" "VOL 100" \
 实测（节选，✅）：
 
 ```
-[欢迎] OK gesture_audio 0.1.0-m1 已连接，输入 HELP 查看指令
+[欢迎] OK gesture_audio 0.2.0 已连接，输入 HELP 查看指令
 [OK  ] VOL 70        ->  OK VOL 70
 [ERR ] SPEED 2.5     ->  ERR SPEED 超出 0.5..2.0
 [ERR ] EQ mid 99     ->  ERR EQ 增益超出 -12..12 dB
@@ -363,6 +391,14 @@ python tools/netctl.py <板子IP> --clients 5
 
 任何已连接客户端每 500ms 收到一行 `STATUS …`（无需请求）。
 `tools/netctl.py` 默认只打印回执，加 `--show-status` 才显示推送——避免推送淹没回执。
+
+> **M6-01/02 主机侧自动化（2026-11-12）**：`tools/protocol_matrix.py` **60/0**
+> 覆盖全部指令/越界、STATUS 字段、500ms 推送（实测 537–563ms）、4 连接上限与槽位释放、
+> 半包/粘包/空行/超长行/QUIT、断线重连。PC 客户端 `client/gesture_client.py`
+> 已提供 GUI 与 `--cli`；`--gui-smoke` PASS，`tools/client_link_test.py` **7/7**
+> （连接/心跳/断开/同端口重连/重连后指令）。
+> 同时修了 STATUS 在 EOF/STOPPED 下取播放线程旧参数的问题：`server_format_status()`
+> 现在直接合并 `params_get()` 的当前值，任何状态都能看到刚下发的音量/速度/回声。
 
 #### T4.4 QUIT / 超长行
 
@@ -590,6 +626,38 @@ python tools/netctl.py <板子IP> "VOL 80"               # 2.4 秒时发
 # 6) 长跑
 ./gesture_audio --run 300 --port 8888 --log info audio/test_30s.wav
 ```
+
+## 8. 板端合并清单（一次上板跑完）
+
+> 目的：把「部署 + D1–D3 板端复测 + M5Q-08 听感 + M5Q-09 CPU/延迟 + M6-03 回环」
+> 一次上板跑完，减少串口来回。每项当场记 ✅/❌，跑完按 §6 恢复网络、报“板子空闲”。
+
+| 序 | 项目 | 命令 / 方法 | 判定（当场记录） |
+|---|---|---|---|
+| ① | 部署最新二进制 | `strip` + `gzip` 后覆盖 `/root/gapp/bin/gesture_audio`，记 commit SHA / SHA256 / 板端 `md5sum` | 板端 `--selftest` 19 过 / 0 败 / 1 跳 |
+| ② | D1–D3 板端复测 | 短素材跑 EOF→`NEXT`（D1）；`PAUSE` 冻结 pos（D2）；坏文件→`ERROR` 粘滞（D3） | 三态与 §5 D1/D2/D3 一致 |
+| ③ | M5Q-08 听感 A/B | 三套 `--eq-preset` × 回声开关 × 0.5/1.0/2.0x（§3.7） | 无 click/破音/金属回声；记录每人偏好 |
+| ④ | M5Q-09 CPU/延迟 | 效果全开 `--run 300 --port 8888`，`top -n 1` + `STATUS` 记 RSS/`und`/CPU | `und` 不增长、CPU<30%、P95≤300ms |
+| ⑤ | M6-03 板端回环 | 板端 `nc 127.0.0.1:8888` 手敲 `HELP`/`STATUS`/`VOL 70`/`SPEED 1.5` | 回执正确、500ms `STATUS` 推送 |
+| ⑥ | T0 readelf 原文 | VM 里四条 `readelf`（§T0 命令），原文贴回本表/`agentLogs` | `Machine=ARM`、解释器 `ld-linux.so.3`、GLIBC ≤ 2.23 |
+
+```bash
+# ① 部署（集成机 → 板 /root/gapp）
+make BOARD=1 CROSS=arm-linux-
+arm-linux-strip build/gesture_audio && gzip -k build/gesture_audio
+# 传 gesture_audio.gz 到板，解压覆盖 /root/gapp/bin/gesture_audio
+cd /root/gapp && ./bin/gesture_audio --selftest
+
+# ② D1–D3：短素材（EOF 后 NEXT）、PAUSE、坏文件（不存在的 WAV）见 §5
+# ③ M5Q-08：见 §3.7 三套预设命令
+# ④ M5Q-09：效果全开长跑
+./bin/gesture_audio --sensor sim --eq-preset standard --run 300 --port 8888 --log info audio/test_30s.wav
+
+# ⑤ M6-03：板端回环
+nc 127.0.0.1:8888        # 依次敲 HELP / STATUS / VOL 70 / SPEED 1.5
+```
+
+> 完成后把 ①–⑥ 的实测值回填到附录 B 记录表与 `taskBoard.md §3.6`，并跑 §7 速查确认收尾。
 
 ## 附录 A：Windows 开发机（无 sh.exe / 无 gcc）编译命令
 
