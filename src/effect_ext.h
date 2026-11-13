@@ -35,4 +35,11 @@ const char *effect_eq_preset_name(int preset);
 int         effect_eq_preset(void);
 void        effect_eq_set_preset(int preset);
 
+/* ---------------- M5Q-10：变调不变速（音高移调） ----------------
+ * 卡拉OK 式移调，±12 半音。实现为内部时域颗粒移调（src/pitch.c），
+ * 默认 0（旁通）。板端不进协议、不改 UI，仅由 --pitch 命令行与离线工具
+ * 选择；答辩时说明这是 boardGuide §3.3「v1 砍变调」之外的可选低成本实现。 */
+void  effect_pitch_set_semitones(float semitones);
+float effect_pitch_semitones(void);
+
 #endif /* EFFECT_EXT_H */

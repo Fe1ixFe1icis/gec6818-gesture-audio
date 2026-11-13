@@ -23,6 +23,7 @@
 
 #include "effect.h"
 #include "effect_ext.h"
+#include "pitch.h"
 #include "common.h"
 #include "config.h"
 
@@ -100,6 +101,7 @@ static int         s_rate = AUDIO_RATE_HZ;
 static int         s_channels = AUDIO_CHANNELS;
 static effect_cfg_t s_cfg;
 static int         s_inited;
+static pitch_t     s_pitch;               /* M5Q-10：变调（链尾，独立模块） */
 
 static int clamp_i(int v, int lo, int hi)
 {
@@ -354,12 +356,14 @@ int effect_init(int rate, int channels)
         s_hpf[ch].z1 = s_hpf[ch].z2 = 0.0f;
     if (echo_alloc_max() != 0)
         return -1;
+    pitch_init(&s_pitch, channels, rate);
     effect_reset();
     return 0;
 }
 
 void effect_finish(void)
 {
+    pitch_finish(&s_pitch);
     free(s_echo_buf);
     s_echo_buf = NULL;
     s_echo_cap = s_echo_w = 0;
@@ -387,6 +391,8 @@ void effect_reset(void)
     /* M5Q-03：切歌清延迟线是必要的（旧音频不能串到新曲目），
      * 但**改延迟**不再走这里——见 echo_set_delay()。 */
     echo_clear();
+    /* M5Q-10：切歌清空变调延迟线（旧音频不能串到新曲目） */
+    pitch_reset(&s_pitch);
 
     /* M5Q-02：切歌/复位后没有信号连续性，增益无需斜坡，直接落到目标并重算
      * 系数（z1/z2 刚已清零，重算后保持零态）。 */
@@ -508,18 +514,33 @@ void effect_eq_set_preset(int preset)
          EQ_PRESETS[preset].name, s_eq_xf_len);
 }
 
+/* M5Q-10：变调内部扩展（声明在 src/effect_ext.h）。只动音高、不改时长，
+ * 不进 include/ 冻结接口与协议；默认 0（旁通）。 */
+void effect_pitch_set_semitones(float semitones)
+{
+    pitch_set_semitones(&s_pitch, semitones);
+    LOGD(TAG, "变调 = %+.1f 半音（ratio %.4f）", s_pitch.semitones, s_pitch.ratio);
+}
+
+float effect_pitch_semitones(void)
+{
+    return s_pitch.semitones;
+}
+
 int effect_active(void)
 {
     if (!s_inited) return 0;
     if (s_cfg.echo_on) return 1;
     if (s_cfg.eq_low || s_cfg.eq_mid || s_cfg.eq_high) return 1;
+    if (pitch_active(&s_pitch)) return 1;
     return 0;
 }
 
 void effect_process(int16_t *buf, int frames)
 {
     int i, ch, band;
-    int eq_on = (s_cfg.eq_low || s_cfg.eq_mid || s_cfg.eq_high) ? 1 : 0;
+    int eq_on    = (s_cfg.eq_low || s_cfg.eq_mid || s_cfg.eq_high) ? 1 : 0;
+    int pitch_on = pitch_active(&s_pitch);
     float fb  = (float)s_cfg.echo_fb / 100.0f;
 
     if (!s_inited || !buf || frames <= 0) return;
@@ -539,10 +560,12 @@ void effect_process(int16_t *buf, int frames)
                 eq_recalc(band);   /* z1/z2 已清，重算后保持零态 */
             }
         }
-        if (!s_cfg.echo_on) {
-            s_echo_was_on = 0;                /* 全关：旁通快路径 */
-            return;
-        }
+    }
+
+    /* 回声 / EQ / 变调全关才走旁通快路径（M5Q-10 起加入变调判定） */
+    if (!eq_on && !s_cfg.echo_on && !pitch_on) {
+        s_echo_was_on = 0;
+        return;
     }
 
     /* 0) 亚声高通 / DC 阻断（M5Q-05）：放在回声与 EQ 之前。
@@ -653,4 +676,9 @@ void effect_process(int16_t *buf, int frames)
                 s_eq_xf_len = 0;
         }
     }
+
+    /* 3) 变调（M5Q-10）：链尾，独立移调不变速。放在回声/EQ 之后，
+     * 使移调只作用于已完成的音色（不与反馈/EQ 相互染色）。 */
+    if (pitch_on)
+        pitch_process(&s_pitch, buf, frames);
 }

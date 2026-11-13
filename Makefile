@@ -77,7 +77,7 @@ tools: | $(BUILD)
 audio_quality: | $(BUILD)
 	$(HOSTCC) -std=gnu99 -O2 -Wall -Wextra -Wno-unused-parameter \
 	  -Iinclude -Isrc -DBOARD=0 -D_GNU_SOURCE -pthread \
-	  tools/audio_quality.c src/effect.c src/resample.c src/log.c \
+	  tools/audio_quality.c src/effect.c src/resample.c src/pitch.c src/log.c \
 	  -o $(BUILD)/audio_quality $(AQLDLIBS)
 	@echo "== tool: $(BUILD)/audio_quality =="
 

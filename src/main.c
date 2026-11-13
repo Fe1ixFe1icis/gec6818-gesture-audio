@@ -59,6 +59,7 @@ static void usage(const char *argv0)
         "  --sensor sim|i2c     传感器后端（默认 sim；i2c 不可用时自动降级）\n"
         "  --no-display         不启动显示线程\n"
         "  --eq-preset <名称>   EQ 内部预设：standard|vocal|demo（默认 standard）\n"
+        "  --pitch <半音>       变调不变速（音高移调，±12，默认 0 旁通）\n"
         "  --run <秒>           运行指定秒数后自动退出（自动化测试用）\n"
         "  --log error|warn|info|debug   日志级别（默认 info）\n"
         "  --selftest           跑内置自检后退出（不需要声卡/LCD/传感器）\n"
@@ -90,10 +91,11 @@ static void banner(void)
     printf(" 队列 %d · 采样 %d Hz/%dch · period %d · 仲裁窗口 %dms\n",
            CTRL_QUEUE_LEN, AUDIO_RATE_HZ, AUDIO_CHANNELS,
            AUDIO_PERIOD_FRAMES, ARB_NET_HOLD_MS);
-    printf(" 端口 %d · 传感器 %s · 显示 %s · EQ 预设 %s · 曲目 %d 首\n",
+    printf(" 端口 %d · 传感器 %s · 显示 %s · EQ 预设 %s · 变调 %+.1f 半音 · 曲目 %d 首\n",
            g_app.port, sensor_backend_name(g_app.sensor_backend),
            g_app.display_enabled ? "on" : "off",
-           effect_eq_preset_name(effect_eq_preset()), g_app.track_count);
+           effect_eq_preset_name(effect_eq_preset()),
+           effect_pitch_semitones(), g_app.track_count);
     printf("==================================================\n\n");
 }
 
@@ -186,6 +188,7 @@ int main(int argc, char **argv)
     pthread_t th_sensor, th_player, th_display, th_server;
     int has_sensor = 0, has_player = 0, has_display = 0, has_server = 0;
     int eq_preset = -1;
+    float pitch_semitones = 0.0f;
     int i;
     int64_t start;
 
@@ -227,6 +230,8 @@ int main(int argc, char **argv)
                 return 2;
             }
             eq_preset = found;
+        } else if (!strcmp(a, "--pitch") && i + 1 < argc) {
+            pitch_semitones = (float)atof(argv[++i]);
         } else if (!strcmp(a, "--run") && i + 1 < argc) {
             g_app.run_seconds = atoi(argv[++i]);
         } else if (!strcmp(a, "--log") && i + 1 < argc) {
@@ -260,6 +265,9 @@ int main(int argc, char **argv)
     /* M5Q-06：EQ 预设是内部选项，不进协议；必须在 effect_init 之后设置 */
     if (eq_preset >= 0)
         effect_eq_set_preset(eq_preset);
+    /* M5Q-10：变调是内部选项，不进协议；默认 0 旁通 */
+    if (pitch_semitones != 0.0f)
+        effect_pitch_set_semitones(pitch_semitones);
 
     /* ---- 版式预览模式：渲染一帧写 BMP 后退出，不起线程 ---- */
     if (g_app.dump_bmp) {

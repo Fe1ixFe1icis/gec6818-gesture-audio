@@ -67,6 +67,7 @@
 #define LIM_HPF_DB         -12.0   /* 10Hz 处衰减下限 dB（M5Q-05） */
 #define LIM_DC_LSB         1       /* DC 阻断后残留上限（LSB，M5Q-05） */
 #define LIM_PRESET_RATIO   1.5     /* 预设切换差分峰值 / 稳态基线上限（M5Q-06） */
+#define LIM_PITCH_CENTS    20.0    /* 变调基频允许偏差上限（音分，M5Q-10） */
 
 static int g_fails = 0;
 
@@ -938,6 +939,84 @@ static void test_eq_preset_switch(const char *outdir)
     free(buf);
 }
 
+/* ================= M5Q-10：变调不变速 ================= */
+
+/* 取左声道频谱峰值基频（Hz）。跳过低频区，返回最强 bin 对应频率。 */
+static double measure_peak_hz(const int16_t *buf, long frames)
+{
+    double *re = malloc(FFT_N * sizeof(double));
+    double *im = malloc(FFT_N * sizeof(double));
+    double *x  = malloc(FFT_N * sizeof(double));
+    long n;
+    int i, bin;
+    double hz;
+
+    memset(re, 0, FFT_N * sizeof(double));
+    memset(im, 0, FFT_N * sizeof(double));
+    n = window_left(buf, frames, x, FFT_N);
+    for (i = 0; i < n; i++) re[i] = x[i];
+    fft_radix2(re, im, FFT_N, 0);
+    bin = peak_bin(re, im, FFT_N);
+    hz = (double)bin * (double)RATE / (double)FFT_N;
+    free(re); free(im); free(x);
+    return hz;
+}
+
+static long count_clip(const int16_t *buf, long frames)
+{
+    long i, c = 0;
+    for (i = 0; i < frames; i++) {
+        int a = buf[i * CH];
+        if (a >= 32767 || a <= -32768) c++;
+    }
+    return c;
+}
+
+/* 1000Hz 正弦经 --pitch 后，基频应为 1000 × 2^(半音/12)；且无硬削波。
+ * 时长由 effect_process 就地保证 1:1（变调不变速）。 */
+static void test_pitch_shift(const char *outdir)
+{
+    static const double cases[] = { 12.0, -12.0, 7.0 };
+    const long frames = RATE * 2;
+    const long skip   = RATE / 2;      /* 跳过延迟线填充与交叉淡化建立 */
+    int16_t *buf = malloc((size_t)frames * CH * sizeof(int16_t));
+    char detail[256];
+    int i, all_ok = 1;
+    long clips = 0;
+    double worst = 0.0;
+
+    printf("\n== 变调不变速（--pitch，granular time-domain）==\n");
+    for (i = 0; i < (int)(sizeof cases / sizeof cases[0]); i++) {
+        double semi   = cases[i];
+        double ratio  = pow(2.0, semi / 12.0);
+        double expect = 1000.0 * ratio;
+        double meas, cents;
+
+        gen_sine(buf, frames, 1000.0, RATE, 16000.0);
+        effect_pitch_set_semitones((float)semi);
+        effect_reset();
+        effect_process(buf, (int)frames);
+
+        meas  = measure_peak_hz(buf + skip * CH, frames - skip);
+        cents = 1200.0 * (log(meas / expect) / log(2.0));
+        if (cents < 0.0) cents = -cents;
+        if (cents > worst) worst = cents;
+        if (cents > LIM_PITCH_CENTS) all_ok = 0;
+
+        clips += count_clip(buf + skip * CH, frames - skip);
+        printf("    %+5.1f 半音 : 期望 %6.1f Hz  实测 %6.1f Hz  偏差 %5.1f 音分\n",
+               semi, expect, meas, cents);
+    }
+
+    snprintf(detail, sizeof detail,
+             "3 组移调最大偏差 %.1f 音分，削波样本 %ld",
+             worst, clips);
+    report("pitch_shift", all_ok && clips == 0,
+           "变调不变速", "偏差<20音分 且无削波", detail);
+    (void)outdir;
+    free(buf);
+}
+
 /* ================= main ================= */
 int main(int argc, char **argv)
 {
@@ -979,6 +1058,7 @@ int main(int argc, char **argv)
     test_echo_delay_switch(outdir);
     test_echo_self_osc(outdir);
     test_echo_mix(outdir);
+    test_pitch_shift(outdir);
 
     effect_finish();
 

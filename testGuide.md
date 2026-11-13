@@ -332,6 +332,13 @@ python tools/netctl.py <板子IP> "ECHO on 250 40" "EQ mid 6" "EQ low -6" STATUS
 >
 > 听感重点：120Hz 低架不再“轰头”、6kHz 高架不刺耳、三套预设切换无“咔/爆”。
 
+> **M5Q-10 变调不变速（内部可选，非协议，2026-11-13）**：时域颗粒移调（双读头 +
+> 互补三角交叉淡化），`ratio = 2^(半音/12)`，输出时长 1:1。默认 0 = 旁通（效果全关仍逐字节
+> bypass），CLI `--pitch <半音>`（±12）开启；**不进协议、不动冻结接口**。离线量化
+> `make audio_quality` 的 `pitch_shift` 三组（+12/−12/+7 半音）最大偏差 **16.1 音分**、
+> 削波 0，PASS（阈值 < 20 音分）。已知代价：granular 算法固有轻微 warble（时域侧带），
+> 故 v1 默认关，仅演示/彩排可选开；取舍见 `boardGuide.md §3.3`。
+
 ### T4 TCP 协议
 
 #### T4.1 指令与回执（✅ 本机通过）
@@ -619,6 +626,38 @@ python tools/netctl.py <板子IP> "VOL 80"               # 2.4 秒时发
 # 6) 长跑
 ./gesture_audio --run 300 --port 8888 --log info audio/test_30s.wav
 ```
+
+## 8. 板端合并清单（一次上板跑完）
+
+> 目的：把「部署 + D1–D3 板端复测 + M5Q-08 听感 + M5Q-09 CPU/延迟 + M6-03 回环」
+> 一次上板跑完，减少串口来回。每项当场记 ✅/❌，跑完按 §6 恢复网络、报“板子空闲”。
+
+| 序 | 项目 | 命令 / 方法 | 判定（当场记录） |
+|---|---|---|---|
+| ① | 部署最新二进制 | `strip` + `gzip` 后覆盖 `/root/gapp/bin/gesture_audio`，记 commit SHA / SHA256 / 板端 `md5sum` | 板端 `--selftest` 19 过 / 0 败 / 1 跳 |
+| ② | D1–D3 板端复测 | 短素材跑 EOF→`NEXT`（D1）；`PAUSE` 冻结 pos（D2）；坏文件→`ERROR` 粘滞（D3） | 三态与 §5 D1/D2/D3 一致 |
+| ③ | M5Q-08 听感 A/B | 三套 `--eq-preset` × 回声开关 × 0.5/1.0/2.0x（§3.7） | 无 click/破音/金属回声；记录每人偏好 |
+| ④ | M5Q-09 CPU/延迟 | 效果全开 `--run 300 --port 8888`，`top -n 1` + `STATUS` 记 RSS/`und`/CPU | `und` 不增长、CPU<30%、P95≤300ms |
+| ⑤ | M6-03 板端回环 | 板端 `nc 127.0.0.1:8888` 手敲 `HELP`/`STATUS`/`VOL 70`/`SPEED 1.5` | 回执正确、500ms `STATUS` 推送 |
+| ⑥ | T0 readelf 原文 | VM 里四条 `readelf`（§T0 命令），原文贴回本表/`agentLogs` | `Machine=ARM`、解释器 `ld-linux.so.3`、GLIBC ≤ 2.23 |
+
+```bash
+# ① 部署（集成机 → 板 /root/gapp）
+make BOARD=1 CROSS=arm-linux-
+arm-linux-strip build/gesture_audio && gzip -k build/gesture_audio
+# 传 gesture_audio.gz 到板，解压覆盖 /root/gapp/bin/gesture_audio
+cd /root/gapp && ./bin/gesture_audio --selftest
+
+# ② D1–D3：短素材（EOF 后 NEXT）、PAUSE、坏文件（不存在的 WAV）见 §5
+# ③ M5Q-08：见 §3.7 三套预设命令
+# ④ M5Q-09：效果全开长跑
+./bin/gesture_audio --sensor sim --eq-preset standard --run 300 --port 8888 --log info audio/test_30s.wav
+
+# ⑤ M6-03：板端回环
+nc 127.0.0.1:8888        # 依次敲 HELP / STATUS / VOL 70 / SPEED 1.5
+```
+
+> 完成后把 ①–⑥ 的实测值回填到附录 B 记录表与 `taskBoard.md §3.6`，并跑 §7 速查确认收尾。
 
 ## 附录 A：Windows 开发机（无 sh.exe / 无 gcc）编译命令
 
