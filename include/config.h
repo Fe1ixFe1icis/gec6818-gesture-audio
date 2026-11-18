@@ -36,7 +36,7 @@
 #define EQ_GAIN_MAX_DB     12
 
 /* 默认值（开机态） */
-#define DEF_VOLUME         60
+#define DEF_VOLUME         10
 #define DEF_SPEED_X10      10
 #define DEF_ECHO_ON        0
 #define DEF_ECHO_DELAY_MS  250
