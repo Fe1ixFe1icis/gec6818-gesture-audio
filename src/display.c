@@ -4,9 +4,26 @@
  * 画布策略：先在内存画布（800×480×4，1.5MB 静态 BSS）上整帧绘制，
  * 再一次性提交，杜绝「画到一半」的撕裂（boardGuide.md §3.1）。
  *
- * 字库：内置 5×7 ASCII 点阵（0x20–0x5F），按整数倍放大绘制。
- * 不引入 freetype、不读字体文件 —— 板上零依赖、零解码开销。
- * 中文留到 M4 用字模工具生成数组后再加，别在这里临时挂字体库。
+ * 字库：ASCII 用内置 5×7 点阵按整数倍放大；中文用 tools/gen_font_cn.py
+ * 预生成的 16×16 点阵（src/font_cn.c）。不引入 freetype、不读字体文件 ——
+ * 板上零依赖、零解码开销（boardGuide.md §3.1 的坑位要求）。
+ *
+ * 版式（2026-11-19 M4 重构，800×480）：
+ *   ┌──────────────────────────────────────────────┐
+ *   │ 手势音频播放器 Vx.y.z     网/欠/帧    [播放中] │ 48px 顶栏
+ *   ├──────────────┬───────────────────────────────┤
+ *   │ 音量  72 %   │ 速度  ██████░░░░       1.2X    │
+ *   │ ████████░░░  │ 回声  ████░░░░░░       开      │ 左 250 / 右 516
+ *   │  [ - ] [ + ] │ 低音  ██░░░░██░░       +3DB    │
+ *   │              │ 中音  …                        │
+ *   ├──────────────┴───────────────────────────────┤
+ *   │ 波形示波器 + 播放进度线                        │ 140px
+ *   ├──────────────────────────────────────────────┤
+ *   │ [上一首] [播放] [下一首] │ 曲目 1/3  00:12/00:38│ 64px
+ *   └──────────────────────────────────────────────┘
+ *
+ * 触摸几何（命中区）也定义在本文件：display.c 是版式与命中区的唯一 owner，
+ * touch.c 只做 evdev → 坐标 → display_hit_test() → 投递指令（src/ui_ext.h）。
  */
 #include <stdio.h>
 #include <string.h>
@@ -17,6 +34,8 @@
 #include "common.h"
 #include "app.h"
 #include "config.h"
+#include "font_cn.h"
+#include "ui_ext.h"
 
 #if defined(BOARD) && BOARD
 #include <fcntl.h>
@@ -37,8 +56,47 @@
 #define C_ACCENT    0x0038D6A0u
 #define C_ACCENT2   0x00489BE8u
 #define C_WARN      0x00E0A030u
+#define C_ERR       0x00E05A5Au
 #define C_BARBG     0x00202A34u
 #define C_GRID      0x001E2830u
+
+/* ---------------- 版式常量（改版式只改这一段） ---------------- */
+#define MARGIN      12
+#define HDR_H       48
+#define HDR_PILL_X  (LCD_W - 16 - 144)
+#define HDR_PILL_Y  10
+#define HDR_PILL_W  144
+#define HDR_PILL_H  28
+
+#define LEFT_X      MARGIN
+#define LEFT_Y      58
+#define LEFT_W      250
+#define LEFT_H      192
+
+#define RIGHT_X     (LEFT_X + LEFT_W + 10)          /* 272 */
+#define RIGHT_W     (LCD_W - RIGHT_X - MARGIN)      /* 516 */
+#define RIGHT_Y     LEFT_Y
+#define RIGHT_H     LEFT_H
+
+#define ROW_Y(i)    (RIGHT_Y + 10 + (i) * 36)       /* 5 行：68/104/140/176/212 */
+#define BAR_X       (RIGHT_X + 64)                  /* 336 */
+#define BAR_W       330
+#define BAR_H       16
+#define ROW_ZONE_H  36                              /* 命中区比条高：手指友好 */
+
+#define SCOPE_X     MARGIN
+#define SCOPE_Y     (LEFT_Y + LEFT_H + 8)           /* 258 */
+#define SCOPE_W     (LCD_W - 2 * MARGIN)            /* 776 */
+#define SCOPE_H     140
+
+#define FOOT_Y      (SCOPE_Y + SCOPE_H + 6)         /* 404 */
+#define FOOT_H      (LCD_H - FOOT_Y - MARGIN)       /* 64 */
+#define BTN_W       150
+#define BTN_X0      MARGIN                          /* 12 */
+#define BTN_X1      (BTN_X0 + BTN_W + 12)           /* 174 */
+#define BTN_X2      (BTN_X1 + BTN_W + 12)           /* 336 */
+#define INFO_X      (BTN_X2 + BTN_W + 12)           /* 498 */
+#define INFO_W      (LCD_W - INFO_X - MARGIN)       /* 290 */
 
 /* ---------------- 5×7 点阵字库（列优先，bit0 = 顶行） ---------------- */
 static const unsigned char FONT5X7[64][5] = {
@@ -153,6 +211,7 @@ static void panel(int x, int y, int w, int h)
     rect_outline(x, y, w, h, C_EDGE);
 }
 
+/* ---------------- ASCII（5×7） ---------------- */
 static void draw_char(int x, int y, int ch, int scale, uint32_t color)
 {
     int col, row;
@@ -171,7 +230,7 @@ static void draw_char(int x, int y, int ch, int scale, uint32_t color)
     }
 }
 
-/* 绘制字符串，返回结束 x 坐标（便于右对齐计算） */
+/* 绘制 ASCII 字符串，返回结束 x 坐标（便于右对齐计算） */
 static int draw_text(int x, int y, const char *s, int scale, uint32_t color)
 {
     while (*s) {
@@ -182,16 +241,95 @@ static int draw_text(int x, int y, const char *s, int scale, uint32_t color)
     return x;
 }
 
-static int text_width(const char *s, int scale)
+/* ---------------- 中文（16×16 点阵） ---------------- */
+static void draw_cn_glyph(int x, int y, const unsigned char *g, uint32_t color)
 {
-    return (int)strlen(s) * 6 * scale;
+    int row, col;
+
+    for (row = 0; row < FONT_CN_H; row++) {
+        unsigned int bits = ((unsigned int)g[row * 2] << 8) | g[row * 2 + 1];
+        for (col = 0; col < FONT_CN_W; col++) {
+            if (bits & (1u << (FONT_CN_W - 1 - col)))
+                px(x + col, y + row, color);
+        }
+    }
 }
 
-static void draw_text_right(int right_x, int y, const char *s, int scale, uint32_t color)
+/* UTF-8 解码：返回码点并前移指针；非法/截断返回 0 */
+static unsigned int utf8_next(const unsigned char **pp)
 {
-    draw_text(right_x - text_width(s, scale), y, s, scale, color);
+    const unsigned char *p = *pp;
+    unsigned int cp;
+    int n, i;
+
+    if (!*p) return 0;
+    if (*p < 0x80) { *pp = p + 1; return *p; }
+    else if ((*p & 0xE0) == 0xC0) { cp = *p & 0x1F; n = 1; }
+    else if ((*p & 0xF0) == 0xE0) { cp = *p & 0x0F; n = 2; }
+    else if ((*p & 0xF8) == 0xF0) { cp = *p & 0x07; n = 3; }
+    else { *pp = p + 1; return 0; }
+
+    p++;
+    for (i = 0; i < n; i++) {
+        if ((p[i] & 0xC0) != 0x80) { *pp = p; return 0; }
+        cp = (cp << 6) | (p[i] & 0x3F);
+    }
+    *pp = p + n;
+    return cp;
 }
 
+/*
+ * 中英混排：ASCII 用 5×7×scale（在 16px 行高内垂直居中），汉字用 16×16。
+ * 两种字宽不同（12/16），所以必须按字符累加而不是 strlen。
+ */
+static int draw_utf8(int x, int y, const char *s, int scale, uint32_t color)
+{
+    const unsigned char *p = (const unsigned char *)s;
+
+    while (*p) {
+        unsigned int cp = utf8_next(&p);
+
+        if (cp == 0) break;
+        if (cp < 0x80) {
+            draw_char(x, y + (FONT_CN_H - 7 * scale) / 2, (int)cp, scale, color);
+            x += 6 * scale;
+        } else {
+            int idx = font_cn_index(cp);
+            if (idx >= 0) draw_cn_glyph(x, y, font_cn_glyph(idx), color);
+            else          draw_char(x, y + 4, '?', 2, color);
+            x += FONT_CN_W;
+        }
+    }
+    return x;
+}
+
+static int text_utf8_width(const char *s, int scale)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    int w = 0;
+
+    while (*p) {
+        unsigned int cp = utf8_next(&p);
+        if (cp == 0) break;
+        w += (cp < 0x80) ? 6 * scale : FONT_CN_W;
+    }
+    return w;
+}
+
+static void draw_utf8_right(int right_x, int y, const char *s, int scale, uint32_t color)
+{
+    draw_utf8(right_x - text_utf8_width(s, scale), y, s, scale, color);
+}
+
+/* 单字宽按钮：居中画一段文字（中英混排都吃） */
+static void draw_label_center(int x, int y, int w, int h, const char *s,
+                              int scale, uint32_t color)
+{
+    int tw = text_utf8_width(s, scale);
+    draw_utf8(x + (w - tw) / 2, y + (h - FONT_CN_H) / 2, s, scale, color);
+}
+
+/* ---------------- 通用控件 ---------------- */
 /* 单向进度条：v 在 [lo,hi] 内 */
 static void bar_h(int x, int y, int w, int h, int v, int lo, int hi, uint32_t color)
 {
@@ -229,82 +367,199 @@ static void fmt_time(char *buf, int len, int ms)
     snprintf(buf, len, "%02d:%02d", sec / 60, sec % 60);
 }
 
+/* ---------------- 触摸命中区 ---------------- */
+typedef struct {
+    short x, y, w, h;
+    short key;
+} hit_zone_t;
+
+static const hit_zone_t s_zones[] = {
+    /* 左侧音量按钮 */
+    { LEFT_X + 16,  LEFT_Y + 124, 96, 52, UI_KEY_VOL_DOWN },
+    { LEFT_X + 138, LEFT_Y + 124, 96, 52, UI_KEY_VOL_UP   },
+    /* 右侧参数：条的两半分别是「减 / 加」；回声整条是开关 */
+    { BAR_X, ROW_Y(0), BAR_W / 2, ROW_ZONE_H, UI_KEY_SPEED_DOWN },
+    { BAR_X + BAR_W / 2, ROW_Y(0), BAR_W / 2, ROW_ZONE_H, UI_KEY_SPEED_UP },
+    { BAR_X, ROW_Y(1), BAR_W, ROW_ZONE_H, UI_KEY_ECHO_TOGGLE },
+    { BAR_X, ROW_Y(2), BAR_W / 2, ROW_ZONE_H, UI_KEY_LOW_DOWN },
+    { BAR_X + BAR_W / 2, ROW_Y(2), BAR_W / 2, ROW_ZONE_H, UI_KEY_LOW_UP },
+    { BAR_X, ROW_Y(3), BAR_W / 2, ROW_ZONE_H, UI_KEY_MID_DOWN },
+    { BAR_X + BAR_W / 2, ROW_Y(3), BAR_W / 2, ROW_ZONE_H, UI_KEY_MID_UP },
+    { BAR_X, ROW_Y(4), BAR_W / 2, ROW_ZONE_H, UI_KEY_HIGH_DOWN },
+    { BAR_X + BAR_W / 2, ROW_Y(4), BAR_W / 2, ROW_ZONE_H, UI_KEY_HIGH_UP },
+    /* 底部传输键 */
+    { BTN_X0, FOOT_Y, BTN_W, FOOT_H, UI_KEY_PREV },
+    { BTN_X1, FOOT_Y, BTN_W, FOOT_H, UI_KEY_TOGGLE },
+    { BTN_X2, FOOT_Y, BTN_W, FOOT_H, UI_KEY_NEXT }
+};
+
+static const hit_zone_t *zone_of(int key)
+{
+    unsigned int i;
+    for (i = 0; i < sizeof s_zones / sizeof s_zones[0]; i++)
+        if (s_zones[i].key == key) return &s_zones[i];
+    return NULL;
+}
+
+int display_hit_test(int x, int y)
+{
+    unsigned int i;
+
+    for (i = 0; i < sizeof s_zones / sizeof s_zones[0]; i++) {
+        const hit_zone_t *z = &s_zones[i];
+        if (x >= z->x && x < z->x + z->w && y >= z->y && y < z->y + z->h)
+            return z->key;
+    }
+    return UI_KEY_NONE;
+}
+
+/* 触摸反馈状态：touch 线程写，display 线程读；只用于视觉反馈，不加锁 */
+static volatile int     s_flash_key;
+static volatile int64_t s_flash_until;
+static volatile int     s_mark_x, s_mark_y;
+static volatile int64_t s_mark_until;
+
+void display_flash_key(int key)
+{
+    s_flash_key = key;
+    s_flash_until = now_ms() + 300;
+}
+
+void display_touch_mark(int x, int y)
+{
+    s_mark_x = x;
+    s_mark_y = y;
+    s_mark_until = now_ms() + 300;
+}
+
+static void draw_key_button(int x, int y, int w, int h, const char *label,
+                            int scale, uint32_t color)
+{
+    panel(x, y, w, h);
+    draw_label_center(x, y, w, h, label, scale, color);
+}
+
 /* ---------------- 各区块 ---------------- */
+static const char *state_cn(play_state_t s)
+{
+    switch (s) {
+    case PLAY_PLAYING: return "播放中";
+    case PLAY_PAUSED:  return "已暂停";
+    case PLAY_EOF:     return "已结束";
+    case PLAY_ERROR:   return "出错";
+    case PLAY_STOPPED: /* fall through */
+    default:           return "已停止";
+    }
+}
+
+static uint32_t state_color(play_state_t s)
+{
+    switch (s) {
+    case PLAY_PLAYING: return C_ACCENT;
+    case PLAY_PAUSED:  return C_WARN;
+    case PLAY_ERROR:   return C_ERR;
+    case PLAY_EOF:     /* fall through */
+    case PLAY_STOPPED: /* fall through */
+    default:           return C_DIM;
+    }
+}
+
+static const char *gesture_cn(gesture_t g)
+{
+    switch (g) {
+    case GESTURE_UP:    return "上";
+    case GESTURE_DOWN:  return "下";
+    case GESTURE_LEFT:  return "左";
+    case GESTURE_RIGHT: return "右";
+    case GESTURE_PUSH:  return "推";
+    case GESTURE_PULL:  return "拉";
+    case GESTURE_HOVER: return "悬停";
+    case GESTURE_NONE:  /* fall through */
+    default:            return "无";
+    }
+}
+
 static void draw_header(const status_t *st)
 {
-    const char *state = play_state_name(st->state);
-    uint32_t state_color = C_ACCENT;
+    char buf[96];
+    int tw;
+    uint32_t sc = state_color(st->state);
 
-    fill_rect(0, 0, LCD_W, 52, C_PANEL);
-    fill_rect(0, 50, LCD_W, 2, C_EDGE);
+    fill_rect(0, 0, LCD_W, HDR_H, C_PANEL);
+    fill_rect(0, HDR_H - 2, LCD_W, 2, C_EDGE);
 
-    draw_text(18, 16, "GESTURE AUDIO", 3, C_TEXT);
-    draw_text(18 + text_width("GESTURE AUDIO", 3) + 18, 20, "V" APP_VERSION, 2, C_DIM);
+    draw_utf8(16, 16, "手势音频播放器", 1, C_TEXT);
+    draw_text(16 + 7 * FONT_CN_W + 12, 20, "V" APP_VERSION, 2, C_DIM);
 
-    if (st->state == PLAY_PAUSED) state_color = C_WARN;
-    if (st->state == PLAY_ERROR || st->state == PLAY_EOF) state_color = C_DIM;
-    draw_text_right(LCD_W - 18, 18, state, 3, state_color);
+    /* 顶栏中部：网络 / 欠载 / 帧率（诊断三件套） */
+    snprintf(buf, sizeof buf, "网 %d  欠 %lu  帧 %d",
+             st->clients, st->underruns, st->fps);
+    draw_utf8(316, 16, buf, 2, C_DIM);
+
+    /* 右上：状态胶囊 */
+    panel(HDR_PILL_X, HDR_PILL_Y, HDR_PILL_W, HDR_PILL_H);
+    tw = text_utf8_width(state_cn(st->state), 1);
+    draw_utf8(HDR_PILL_X + (HDR_PILL_W - tw) / 2, HDR_PILL_Y + 6,
+              state_cn(st->state), 1, sc);
 }
 
 static void draw_volume(const status_t *st)
 {
     char num[8];
-    const int x = 16, y = 66, w = 268, h = 176;
+    int x = LEFT_X, y = LEFT_Y;
+    int nx;
 
-    panel(x, y, w, h);
-    draw_text(x + 16, y + 14, "VOLUME", 2, C_DIM);
+    panel(x, y, LEFT_W, LEFT_H);
+    draw_utf8(x + 16, y + 10, "音量", 1, C_DIM);
 
     snprintf(num, sizeof num, "%d", st->params.volume);
-    draw_text(x + 16, y + 42, num, 9, C_TEXT);
-    draw_text(x + 16 + text_width(num, 9) + 6, y + 42 + 40, "%", 2, C_ACCENT);
+    nx = draw_text(x + 16, y + 36, num, 8, C_TEXT);
+    draw_utf8(nx + 8, y + 36 + 40, "%", 2, C_ACCENT);
 
-    bar_h(x + 16, y + h - 34, w - 32, 14, st->params.volume, VOL_MIN, VOL_MAX, C_ACCENT);
+    bar_h(x + 16, y + 104, LEFT_W - 32, 16,
+          st->params.volume, VOL_MIN, VOL_MAX, C_ACCENT);
+
+    draw_key_button(x + 16,  y + 124, 96, 52, "-", 5, C_TEXT);
+    draw_key_button(x + 138, y + 124, 96, 52, "+", 5, C_TEXT);
 }
 
-static void draw_row(int x0, int w, int y, const char *label, const char *value,
-                     int is_bi, int v, int lo, int hi, uint32_t color)
+static void draw_row_cn(int row_y, const char *label, const char *value,
+                        int is_bi, int v, int lo, int hi, uint32_t color)
 {
-    const int bar_x = x0 + 118;
-    const int bar_w = w - 118 - 76;
-
-    draw_text(x0, y + 6, label, 2, C_DIM);
-    if (is_bi) bar_bi(bar_x, y + 4, bar_w, 18, v, lo, hi, color);
-    else       bar_h (bar_x, y + 4, bar_w, 18, v, lo, hi, color);
-    draw_text_right(x0 + w - 6, y + 6, value, 2, C_TEXT);
+    draw_utf8(RIGHT_X + 16, row_y + 10, label, 1, C_DIM);
+    if (is_bi) bar_bi(BAR_X, row_y + 10, BAR_W, BAR_H, v, lo, hi, color);
+    else       bar_h (BAR_X, row_y + 10, BAR_W, BAR_H, v, lo, hi, color);
+    draw_utf8_right(RIGHT_X + RIGHT_W - 16, row_y + 10, value, 2, C_TEXT);
 }
 
 static void draw_params(const status_t *st)
 {
     char v[24];
-    const int x = 300, y = 66, w = 484, h = 176;
 
-    panel(x, y, w, h);
-    draw_text(x + 16, y + 8, "PARAMETERS", 1, C_DIM);
+    panel(RIGHT_X, RIGHT_Y, RIGHT_W, RIGHT_H);
 
     snprintf(v, sizeof v, "%.1fX", st->params.speed_x10 / 10.0);
-    draw_row(x + 16, w - 32, y + 20, "SPEED", v, 0, st->params.speed_x10,
-             SPEED_MIN_X10, SPEED_MAX_X10, C_ACCENT2);
+    draw_row_cn(ROW_Y(0), "速度", v, 0, st->params.speed_x10,
+                SPEED_MIN_X10, SPEED_MAX_X10, C_ACCENT2);
 
-    snprintf(v, sizeof v, "%s %dMS", st->params.echo_on ? "ON" : "OFF",
-             st->params.echo_delay_ms);
-    draw_row(x + 16, w - 32, y + 52, "ECHO", v, 0,
-             st->params.echo_on ? st->params.echo_fb : 0,
-             ECHO_FB_MIN, ECHO_FB_MAX, st->params.echo_on ? C_ACCENT : C_DIM);
+    draw_row_cn(ROW_Y(1), "回声", st->params.echo_on ? "开" : "关", 0,
+                st->params.echo_on ? st->params.echo_fb : 0,
+                0, ECHO_FB_MAX, st->params.echo_on ? C_ACCENT : C_DIM);
 
     snprintf(v, sizeof v, "%+dDB", st->params.eq_low);
-    draw_row(x + 16, w - 32, y + 84, "EQ LOW", v, 1, st->params.eq_low,
-             EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, C_ACCENT2);
+    draw_row_cn(ROW_Y(2), "低音", v, 1, st->params.eq_low,
+                EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, C_ACCENT2);
     snprintf(v, sizeof v, "%+dDB", st->params.eq_mid);
-    draw_row(x + 16, w - 32, y + 112, "EQ MID", v, 1, st->params.eq_mid,
-             EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, C_ACCENT2);
+    draw_row_cn(ROW_Y(3), "中音", v, 1, st->params.eq_mid,
+                EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, C_ACCENT2);
     snprintf(v, sizeof v, "%+dDB", st->params.eq_high);
-    draw_row(x + 16, w - 32, y + 140, "EQ HI", v, 1, st->params.eq_high,
-             EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, C_ACCENT2);
+    draw_row_cn(ROW_Y(4), "高音", v, 1, st->params.eq_high,
+                EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, C_ACCENT2);
 }
 
 static void draw_scope(const status_t *st)
 {
-    int x = 16, y = 258, w = LCD_W - 32, h = 132;
+    int x = SCOPE_X, y = SCOPE_Y, w = SCOPE_W, h = SCOPE_H;
     int mid = y + h / 2;
     int i;
 
@@ -317,8 +572,8 @@ static void draw_scope(const status_t *st)
     for (i = 0; i < SCOPE_POINTS - 1; i++) {
         int x0 = x + i * (w - 4) / (SCOPE_POINTS - 1) + 2;
         int x1 = x + (i + 1) * (w - 4) / (SCOPE_POINTS - 1) + 2;
-        int y0 = mid - (int)((long)st->scope[i] * (h / 2 - 6) / 32768);
-        int y1 = mid - (int)((long)st->scope[i + 1] * (h / 2 - 6) / 32768);
+        int y0 = mid - (int)((long)st->scope[i] * (h / 2 - 10) / 32768);
+        int y1 = mid - (int)((long)st->scope[i + 1] * (h / 2 - 10) / 32768);
         int t;
 
         if (x1 - x0 <= 1) { px(x0, y0, C_ACCENT); continue; }
@@ -328,31 +583,59 @@ static void draw_scope(const status_t *st)
             px(x0 + t, yy + 1, C_ACCENT);
         }
     }
+
+    /* 播放进度：竖线 + 底部细条 */
+    if (st->len_ms > 0) {
+        int pos = st->pos_ms < 0 ? 0 : st->pos_ms;
+        int pxl = (int)((long)pos * (w - 4) / st->len_ms);
+        if (pxl > w - 4) pxl = w - 4;
+        fill_rect(x + 2 + pxl, y + 2, 2, h - 6, C_ACCENT2);
+        fill_rect(x, y + h - 4, w, 4, C_BARBG);
+        fill_rect(x, y + h - 4, 2 + pxl, 4, C_ACCENT2);
+    }
 }
 
 static void draw_footer(const status_t *st)
 {
-    char buf[160], t1[16], t2[16];
-    int y = 400;
+    char buf[96], t1[16], t2[16];
 
-    panel(16, y, LCD_W - 32, 66);
+    draw_key_button(BTN_X0, FOOT_Y, BTN_W, FOOT_H, "上一首", 1, C_ACCENT2);
+    draw_key_button(BTN_X1, FOOT_Y, BTN_W, FOOT_H,
+                    st->state == PLAY_PLAYING ? "暂停" : "播放", 1, C_ACCENT);
+    draw_key_button(BTN_X2, FOOT_Y, BTN_W, FOOT_H, "下一首", 1, C_ACCENT2);
+
+    panel(INFO_X, FOOT_Y, INFO_W, FOOT_H);
 
     fmt_time(t1, sizeof t1, st->pos_ms);
     fmt_time(t2, sizeof t2, st->len_ms);
-    snprintf(buf, sizeof buf, "TRK %d/%d   %s/%s",
-             st->track_index + 1, st->track_count > 0 ? st->track_count : 0, t1, t2);
-    draw_text(30, y + 12, buf, 2, C_TEXT);
+    snprintf(buf, sizeof buf, "曲目 %d/%d", st->track_index + 1,
+             st->track_count > 0 ? st->track_count : 1);
+    draw_utf8(INFO_X + 12, FOOT_Y + 8, buf, 2, C_TEXT);
+    snprintf(buf, sizeof buf, "%s/%s", t1, t2);
+    draw_utf8_right(INFO_X + INFO_W - 12, FOOT_Y + 8, buf, 2, C_DIM);
 
-    snprintf(buf, sizeof buf, "%s  %dMM", gesture_name(st->gesture), st->distance_mm);
-    draw_text(30, y + 38, buf, 2, C_ACCENT2);
+    snprintf(buf, sizeof buf, "手势 %s", gesture_cn(st->gesture));
+    draw_utf8(INFO_X + 12, FOOT_Y + 34, buf, 2, C_ACCENT2);
+    if (st->distance_mm >= 0) snprintf(buf, sizeof buf, "%dMM", st->distance_mm);
+    else                      snprintf(buf, sizeof buf, "--MM");
+    draw_utf8_right(INFO_X + INFO_W - 12, FOOT_Y + 34, buf, 2, C_DIM);
+}
 
-    snprintf(buf, sizeof buf, "NET %d  UND %lu  FPS %d",
-             st->clients, st->underruns, st->fps);
-    draw_text_right(LCD_W - 30, y + 12, buf, 2, C_DIM);
+/* 触摸反馈画在最上层：按键描边 + 触点小方框 */
+static void draw_feedback(void)
+{
+    int64_t now = now_ms();
+    int key = s_flash_key;
 
-    snprintf(buf, sizeof buf, "Q %d  DROP %lu",
-             ctrl_queue_len(), ctrl_dropped());
-    draw_text_right(LCD_W - 30, y + 38, buf, 2, C_DIM);
+    if (key && now < s_flash_until) {
+        const hit_zone_t *z = zone_of(key);
+        if (z) rect_outline(z->x, z->y, z->w, z->h, C_ACCENT);
+    }
+    if (now < s_mark_until) {
+        int mx = s_mark_x, my = s_mark_y;
+        rect_outline(mx - 8, my - 8, 16, 16, C_WARN);
+        rect_outline(mx - 9, my - 9, 18, 18, C_WARN);
+    }
 }
 
 static void render(const status_t *st)
@@ -363,6 +646,7 @@ static void render(const status_t *st)
     draw_params(st);
     draw_scope(st);
     draw_footer(st);
+    draw_feedback();
 }
 
 /* ---------------- BMP 导出（调试版式） ---------------- */
