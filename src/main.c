@@ -28,6 +28,7 @@
 #include "effect.h"
 #include "effect_ext.h"
 #include "display.h"
+#include "touch.h"
 #include "server.h"
 #include "selftest.h"
 
@@ -185,8 +186,9 @@ static void dispatch(const ctrl_msg_t *m)
 
 int main(int argc, char **argv)
 {
-    pthread_t th_sensor, th_player, th_display, th_server;
-    int has_sensor = 0, has_player = 0, has_display = 0, has_server = 0;
+    pthread_t th_sensor, th_player, th_display, th_server, th_touch;
+    int has_sensor = 0, has_player = 0, has_display = 0, has_server = 0, has_touch = 0;
+    int touch_ok = 0;
     int eq_preset = -1;
     float pitch_semitones = 0.0f;
     int i;
@@ -327,6 +329,9 @@ int main(int argc, char **argv)
     display_init();
     has_display = g_app.display_enabled;
 
+    /* 触摸是 M4 的可选输入通道：找不到 gslX680 只告警，不影响播放/显示 */
+    touch_ok = (touch_init() == 0);
+
     if (g_app.track_count > 0)
         player_request(PLAY_PLAYING);
     else
@@ -337,6 +342,7 @@ int main(int argc, char **argv)
     if (pthread_create(&th_player, NULL, player_thread, NULL) == 0) has_player = 1;
     if (has_server && pthread_create(&th_server, NULL, server_thread, NULL) == 0) has_server = 2;
     if (has_display && pthread_create(&th_display, NULL, display_thread, NULL) == 0) has_display = 2;
+    if (touch_ok && pthread_create(&th_touch, NULL, touch_thread, NULL) == 0) has_touch = 1;
 
     LOGT(TAG, "主循环启动（Ctrl-C 退出）");
     start = now_ms();
@@ -359,12 +365,14 @@ int main(int argc, char **argv)
     ctrl_finish();
 
     if (has_display == 2) pthread_join(th_display, NULL);
+    if (has_touch)        pthread_join(th_touch, NULL);
     if (has_server == 2)  pthread_join(th_server, NULL);
     if (has_player)       pthread_join(th_player, NULL);
     if (has_sensor)       pthread_join(th_sensor, NULL);
 
     server_finish();
     display_finish();
+    touch_finish();
     sensor_finish();
     player_finish();
     ctrl_finish();

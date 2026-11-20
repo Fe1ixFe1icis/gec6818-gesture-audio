@@ -10,6 +10,11 @@
  *      BOARD=0 时空 sink 按墙上时钟推进，保证状态机/时序在主机上可验证。
  *   4. 单写者：参数只从 ctrl（params_get）读，绝不回写；状态机请求由
  *      player_request() 投递，播放线程自己落地。
+ *   5. 板端输出采样率**跟随素材**（44.1k/48k 两档）：这两档 WM8960 原生支持，
+ *      切过去后 step==1.0，48k 素材不再进 64 抽头窗 sinc。板端是软浮点 ABI，
+ *      该重采样是默认路径里最重的一段；不切的话 48k 音乐会在 46ms 缓冲上
+ *      周期性 ALSA 欠载（2026-11-18 板端实测）。非常用采样率或变速时仍回退
+ *      重采样，行为与旧版一致。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,9 +28,11 @@
 #include "common.h"
 #include "app.h"
 #include "resample.h"
+#include "effect_ext.h"     /* 内部扩展：切换输出采样率后保留 EQ 预设/变调 */
 
 #if defined(BOARD) && BOARD
 #include <alsa/asoundlib.h>
+#include <sched.h>          /* SCHED_FIFO：播放线程实时优先级 */
 #endif
 
 /* 板端（Linux）errno.h 里有 ESTRPIPE；开发机自测环境的头文件可能没有，
@@ -60,8 +67,7 @@ static int     s_src_eof;
 static resampler_t s_rs;           /* 抗混叠变速重采样器（M5Q-01） */
 static double      s_last_step;    /* 缓存的 step，变化时才重建系数表 */
 
-static int16_t s_out[AUDIO_PERIOD_FRAMES * AUDIO_CHANNELS];
-static int16_t s_scope[SCOPE_POINTS];
+static int16_t s_out[AUDIO_PERIOD_FRAMES * AUDIO_CHANNELS];static int16_t s_scope[SCOPE_POINTS];
 
 static int     s_rate = AUDIO_RATE_HZ;
 static int     s_channels = AUDIO_CHANNELS;
@@ -181,7 +187,14 @@ static int alsa_open(void)
     snd_pcm_hw_params_t *hw;
     unsigned int rate = (unsigned int)s_rate;
     snd_pcm_uframes_t period = AUDIO_PERIOD_FRAMES;
-    snd_pcm_uframes_t buffer = AUDIO_BUFFER_FRAMES;
+    /*
+     * 板端实测（2026-11-19）：46.5ms 缓冲在「界面 5fps 整屏渲染+1.5MB 提交、
+     * 串口日志、内核 I2C 抖动」叠加下仍会周期性欠载（48k 原速旁通也一样）。
+     * 把缓冲加到 2 倍（≈93ms）吸收这类几十毫秒的调度/带宽抖动；端到端延迟
+     * 预算 300ms 仍然充裕。只改这里的「请求值」，实际值由驱动就近调整并打印。
+     * 不改 include/config.h（冻结接口），这里以它为基数乘 2。
+     */
+    snd_pcm_uframes_t buffer = AUDIO_BUFFER_FRAMES * 2;
     /* 设备回退链：板端可能缺 /usr/share/alsa 配置树，default/plughw 依赖配置，
      * 而 hw:0,0 是 libasound 内置插件、不读配置文件。 */
     static const char *devs[] = { "default", "plughw:0,0", "hw:0,0" };
@@ -219,7 +232,9 @@ static int alsa_open(void)
     snd_pcm_hw_params_free(hw);
     snd_pcm_prepare(s_pcm);
 
-    /* 实际生效值可能被驱动就近调整，打出来才知道真实延迟预算 */
+    /* 实际生效值可能被驱动就近调整，打出来才知道真实延迟预算；
+     * s_rate 必须跟着驱动实际值走，否则重采样 step 会算错。 */
+    s_rate = (int)rate;
     LOGT(TAG, "ALSA 就绪：rate=%u period=%lu 帧(%.1fms) buffer=%lu 帧(%.1fms)",
          rate, (unsigned long)period, 1000.0 * period / rate,
          (unsigned long)buffer, 1000.0 * buffer / rate);
@@ -233,6 +248,48 @@ static void alsa_close(void)
         snd_pcm_close(s_pcm);
         s_pcm = NULL;
     }
+}
+
+/*
+ * 以指定采样率重新打开输出。用于「输出采样率跟随素材」：
+ * 返回 0 = 已切到 rate；返回 1 = rate 打不开但旧采样率已恢复（调用方继续重采样）；
+ * 返回 -1 = 新旧都打不开，音频设备不可用（调用方按致命错误处理）。
+ */
+static int alsa_reopen(int rate)
+{
+    int old_rate = s_rate;
+
+    alsa_close();
+    s_rate = rate;
+    if (alsa_open() == 0)
+        return 0;
+
+    LOGW(TAG, "ALSA 以 %d Hz 重新打开失败，回退 %d Hz", rate, old_rate);
+    s_rate = old_rate;
+    if (alsa_open() == 0)
+        return 1;
+    return -1;
+}
+
+/*
+ * 播放线程实时优先级（板端 root）。
+ *
+ * 为什么需要：46ms 缓冲经不起一次几十毫秒的调度延迟。整屏刷新（5fps，
+ * 每帧 1.5MB）、内核 I2C 超时、串口日志都可能在最坏时刻抢走 CPU；把音频
+ * 线程提到 SCHED_FIFO 后，只要它可运行就先跑，写满缓冲后照常阻塞，不会
+ * 饿死其它线程。失败（非 root/无 CAP_SYS_NICE）只告警，不改语义。
+ */
+static void player_raise_priority(void)
+{
+    struct sched_param sp;
+
+    memset(&sp, 0, sizeof sp);
+    sp.sched_priority = 12;
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+        LOGW(TAG, "实时优先级设置失败（需 root/CAP_SYS_NICE），继续用普通调度");
+        return;
+    }
+    LOGT(TAG, "播放线程已切到 SCHED_FIFO 优先级 %d", sp.sched_priority);
 }
 
 static int alsa_write(const int16_t *buf, int frames)
@@ -413,6 +470,51 @@ void player_fill_scope(int16_t *dst, int points)
 }
 
 /* ================= 文件打开 / 切歌 ================= */
+/*
+ * 板端：把输出采样率切到与素材一致（仅 44.1k/48k 两档，WM8960 原生支持）。
+ * 这样 48k 素材原速播放时 step==1.0，直接 memcpy 旁通 64 抽头窗 sinc，
+ * 从根上去掉「48k 音乐在 46ms 缓冲上周期性欠载」的 CPU 来源。
+ * 返回 0 = 可继续打开曲目（可能没切成功，仍走重采样）；-1 = 设备不可用。
+ */
+#if defined(BOARD) && BOARD
+static int track_apply_native_rate(void)
+{
+    int preset, rc;
+    float semis;
+
+    if (s_wav.rate == s_rate) return 0;
+    /* 其它采样率继续 44.1k + 重采样，避免把不支持的 rate 反复交给驱动 */
+    if (s_wav.rate != 44100 && s_wav.rate != 48000) return 0;
+
+    LOGT(TAG, "素材 %d Hz，尝试把 ALSA 输出切到同一采样率（原速不经过重采样）",
+         s_wav.rate);
+    rc = alsa_reopen(s_wav.rate);
+    if (rc < 0) {
+        LOGE(TAG, "重新打开音频设备失败（目标 %d Hz）", s_wav.rate);
+        return -1;
+    }
+    if (rc > 0) {
+        LOGW(TAG, "切到 %d Hz 失败，继续 %d Hz + 重采样", s_wav.rate, s_rate);
+        return 0;
+    }
+
+    /* EQ/HPF/回声阻尼系数与延迟线长度都按采样率算过，换率必须重建；
+     * 重建会重置内部状态，先把命令行选项（EQ 预设/变调）存下来再恢复。 */
+    preset = effect_eq_preset();
+    semis  = effect_pitch_semitones();
+    if (effect_init(s_rate, s_channels) != 0) {
+        LOGE(TAG, "按 %d Hz 重建效果链失败", s_rate);
+        return -1;
+    }
+    effect_eq_set_preset(preset);
+    effect_pitch_set_semitones(semis);
+    LOGT(TAG, "输出采样率 = %d Hz（原速走重采样旁通）", s_rate);
+    return 0;
+}
+#else
+static int track_apply_native_rate(void) { return 0; }
+#endif
+
 static int track_open(int index)
 {
     const char *path;
@@ -431,6 +533,11 @@ static int track_open(int index)
     rc = wav_parse(s_wav.fp, &s_wav);
     if (rc != 0) {
         LOGE(TAG, "WAV 头非法（rc=%d，需 PCM/16bit/1~2 声道）：%s", rc, path);
+        fclose(s_wav.fp);
+        s_wav.fp = NULL;
+        return -1;
+    }
+    if (track_apply_native_rate() != 0) {
         fclose(s_wav.fp);
         s_wav.fp = NULL;
         return -1;
@@ -590,6 +697,7 @@ void *player_thread(void *arg)
         LOGE(TAG, "音频设备不可用，播放线程退出（显示/网络/手势仍可用）");
         return NULL;
     }
+    player_raise_priority();
 #endif
 
     while (!g_quit) {

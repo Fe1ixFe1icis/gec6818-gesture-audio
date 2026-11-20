@@ -93,14 +93,18 @@ arm:
 	@$(MAKE) BOARD=1 CROSS=$(CROSS)
 
 # 产物 ABI/依赖校验（必须在 Ubuntu/交叉工具链侧跑；Windows 无 readelf）
+# 注意：readelf 的字段名会跟随 locale 本地化（中文环境是「类别:」「机器:」），
+# 这里统一加 LC_ALL=C，否则 grep "Class:|Machine:" 匹配不到，目标会误判失败
+# （2026-11-19 在中文 VM 上踩过）。
 verify: $(TARGET)
 	@echo "== 产物校验：$(TARGET) =="
-	@$(READELF) -h $(TARGET) | grep -E "Class:|Machine:"
-	@$(READELF) -A $(TARGET) 2>/dev/null | grep -E "Tag_ABI_VFP_args|Tag_CPU_arch" || true
-	@$(READELF) -l $(TARGET) | grep -E "interpreter" || true
-	@$(READELF) -d $(TARGET) | grep -E "NEEDED" || true
+	@file $(TARGET) 2>/dev/null || true
+	@LC_ALL=C $(READELF) -h $(TARGET) | grep -E "Class:|Machine:"
+	@LC_ALL=C $(READELF) -A $(TARGET) 2>/dev/null | grep -E "Tag_ABI_VFP_args|Tag_CPU_arch" || true
+	@LC_ALL=C $(READELF) -l $(TARGET) | grep -E "interpreter" || true
+	@LC_ALL=C $(READELF) -d $(TARGET) | grep -E "NEEDED" || true
 	@echo "-- GLIBC 符号版本（板端必须 >= 这些值）--"
-	@$(READELF) --version-info $(TARGET) | grep -o "GLIBC_[0-9.]*" | sort -u || true
+	@LC_ALL=C $(READELF) --version-info $(TARGET) | grep -o "GLIBC_[0-9.]*" | sort -u || true
 
 clean:
 	@$(RMDIR)

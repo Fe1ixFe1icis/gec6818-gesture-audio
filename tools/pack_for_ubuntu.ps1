@@ -57,7 +57,9 @@ finally {
 
 $hash = (Get-FileHash -Path $target -Algorithm SHA256).Hash.ToLower()
 $shaFile = "${target}.sha256"
-"$hash  $name" | Set-Content -Path $shaFile -Encoding ASCII
+# 必须写成 LF 行尾：Ubuntu 的 `sha256sum -c` 会把行尾的 \r 当成文件名的一部分，
+# 报 “没有那个文件或目录”（2026-11-19 踩过）。所以不用 Set-Content（它写 CRLF）。
+[System.IO.File]::WriteAllText($shaFile, "$hash  $name`n", [System.Text.Encoding]::ASCII)
 
 $sizeMb = [math]::Round((Get-Item $target).Length / 1MB, 2)
 Write-Host ""
